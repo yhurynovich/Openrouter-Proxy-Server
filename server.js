@@ -128,6 +128,28 @@ app.post('/v1/chat/completions', async (req, res) => {
         axiosConfig
       );
 
+      // Check for error in response body (OpenRouter returns 200 with error in body for model errors)
+      const responseData = response.data;
+      if (responseData?.error?.message) {
+        const errorMessage = responseData.error.message;
+        const isNvidiaRateLimit = typeof errorMessage === 'string' && 
+          errorMessage.includes('Upstream error from Nvidia') && 
+          errorMessage.includes('ResourceExhausted');
+        
+        if (isNvidiaRateLimit) {
+          console.log('[Response] NVIDIA rate limit detected in response body');
+          // Create an error that will be caught by the catch block
+          const error = new Error('NVIDIA rate limit in response');
+          error.response = {
+            data: responseData,
+            status: 200,
+            headers: response.headers
+          };
+          error.isNvidiaRateLimit = true;
+          throw error;
+        }
+      }
+
       // Mark the successful use of the key
       await keyManager.markKeySuccess();
 
@@ -136,7 +158,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         return handleStreamingResponse(response, res);
       }
 
-      return res.json(response.data);
+      return res.json(responseData);
     } catch (error) {
       // Check if NVIDIA rate limit was detected in stream chunks
       const isNvidiaRateLimitFromStream = error.isNvidiaRateLimit === true;
