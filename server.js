@@ -22,12 +22,16 @@ try {
   console.error('Error creating logs directory:', error);
 }
 
-// Initialize with default key if provided
+// Initialize with default key(s) if provided
 const initializeKeys = async () => {
   try {
-    const defaultKey = process.env.OPENROUTER_API_KEYS;
-    if (defaultKey) {
-      await keyManager.addKey(defaultKey);
+    const defaultKeys = process.env.OPENROUTER_API_KEYS;
+    if (defaultKeys) {
+      // Support comma-separated multiple keys
+      const keys = defaultKeys.split(',').map(k => k.trim()).filter(k => k);
+      for (const key of keys) {
+        await keyManager.addKey(key);
+      }
     }
     await keyManager.initialize();
   } catch (error) {
@@ -35,7 +39,8 @@ const initializeKeys = async () => {
   }
 };
 
-initializeKeys().catch(error => logError(error, { context: 'initializeKeys' }));
+// Wait for initialization before accepting requests
+await initializeKeys();
 
 // Admin endpoint to add new API keys
 app.post('/admin/keys', async (req, res) => {
@@ -81,13 +86,19 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Authorization': `Bearer ${currentKey}`,
           'HTTP-Referer': process.env.HTTP_REFERER || 'http://localhost:3000',
           'X-Title': process.env.SITE_NAME || 'OpenRouterProxy'
-        }
+        },
+        timeout: 120000,  // 2 minute timeout
+        trust_env: false  // Ignore environment proxy settings
       };
 
       // Add responseType: 'stream' for streaming requests
       if (isStreaming) {
         axiosConfig.responseType = 'stream';
       }
+
+      // Add timeout and trust_env for all requests
+      axiosConfig.timeout = 120000;  // 2 minute timeout
+      axiosConfig.trust_env = false;
 
       const response = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -108,7 +119,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const isRateLimit = await keyManager.markKeyError(error);
 
       // Handle streaming errors by ending the response
-      if (isStreaming && res.writableEnded === false) {
+      if (isStreaming && !res.writableEnded) {
         res.write(`data: ${JSON.stringify({
           error: {
             message: error.message,
@@ -116,12 +127,27 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         })}\n\n`);
         res.end();
-        return;
+        return;  // Exit the function completely
       }
 
       // Only retry on rate limits or server errors
       if ((isRateLimit || error.response?.status >= 500) && retryCount < maxRetries - 1) {
         retryCount++;
+        
+        // Add 1 second delay for NVIDIA rate limits
+        if (isRateLimit) {
+          // Check if it's a NVIDIA-specific rate limit
+          const errorData = error.response?.data;
+          const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
+          const isNvidiaRateLimit = typeof errorMessage === 'string' && 
+            errorMessage.includes('Upstream error from Nvidia') && 
+            errorMessage.includes('ResourceExhausted');
+          
+          if (isNvidiaRateLimit) {
+            console.log('[Retry] NVIDIA rate limit hit, waiting 1 second before retry...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        }
         continue;
       }
 
@@ -141,6 +167,9 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         });
       }
+      
+      // For streaming, we've already ended the response above
+      return;
     }
   }
 });
@@ -158,7 +187,9 @@ app.get('/v1/models', async (req, res) => {
           'Authorization': `Bearer ${currentKey}`,
           'HTTP-Referer': process.env.HTTP_REFERER || 'http://localhost:3000',
           'X-Title': process.env.SITE_NAME || 'OpenRouterProxy'
-        }
+        },
+        timeout: 30000,  // 30 second timeout
+        trust_env: false
       };
 
       const response = await axios.get(

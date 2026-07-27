@@ -68,18 +68,44 @@ class KeyManager {
     }
   }
 
+  /**
+   * Check if an error response contains NVIDIA rate limit error
+   * Error format: "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (32/32)"
+   */
+  isNvidiaRateLimitError(error) {
+    if (!error.response?.data) return false;
+    
+    const data = error.response.data;
+    // Check both OpenAI error format and raw text
+    const errorMessage = data.error?.message || 
+                         data.message || 
+                         JSON.stringify(data);
+    
+    return typeof errorMessage === 'string' && 
+           errorMessage.includes('Upstream error from Nvidia') && 
+           errorMessage.includes('ResourceExhausted');
+  }
+
   async markKeyError(error) {
     if (!this.currentKey) return;
 
     try {
-      // Check if it's a rate limit error
-      if (error.response?.status === 429) {
+      // Check if it's a rate limit error (HTTP 429)
+      const isHttpRateLimit = error.response?.status === 429;
+      
+      // Check for NVIDIA-specific rate limit in response body
+      const isNvidiaRateLimit = this.isNvidiaRateLimitError(error);
+      
+      const isRateLimit = isHttpRateLimit || isNvidiaRateLimit;
+
+      if (isRateLimit) {
         const resetTime = error.response.headers['x-ratelimit-reset'];
         this.currentKey.rateLimitResetAt = resetTime ? new Date(resetTime * 1000) : new Date(Date.now() + 60000);
         
         logKeyEvent('Rate Limit Hit', {
           keyId: this.currentKey._id,
-          resetTime: this.currentKey.rateLimitResetAt
+          resetTime: this.currentKey.rateLimitResetAt,
+          isNvidia: isNvidiaRateLimit
         });
 
         await this.currentKey.save();
