@@ -63,9 +63,31 @@ async function handleStreamingResponse(axiosResponse, res) {
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
+  let buffer = '';
+  let nvidiaRateLimitDetected = false;
+
   for await (const chunk of axiosResponse.data) {
+    // Check for NVIDIA rate limit error in stream chunks
+    buffer += chunk.toString();
+    
+    // Look for the NVIDIA error in SSE data format
+    if (buffer.includes('Upstream error from Nvidia') && buffer.includes('ResourceExhausted')) {
+      nvidiaRateLimitDetected = true;
+      console.log('[Stream] NVIDIA rate limit detected in stream chunks');
+      // Don't write this error to client - we'll throw to trigger retry
+      break;
+    }
+    
     res.write(chunk);
   }
+  
+  if (nvidiaRateLimitDetected) {
+    // Throw error to trigger retry logic
+    const error = new Error('NVIDIA rate limit in stream');
+    error.isNvidiaRateLimit = true;
+    throw error;
+  }
+  
   res.end();
 }
 
@@ -116,18 +138,23 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       return res.json(response.data);
     } catch (error) {
+      // Check if NVIDIA rate limit was detected in stream chunks
+      const isNvidiaRateLimitFromStream = error.isNvidiaRateLimit === true;
+      
       const isRateLimit = await keyManager.markKeyError(error);
 
       // Check if it's a NVIDIA rate limit (for delay)
       const errorData = error.response?.data;
       const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
-      const isNvidiaRateLimit = typeof errorMessage === 'string' && 
+      const isNvidiaRateLimitFromResponse = typeof errorMessage === 'string' && 
         errorMessage.includes('Upstream error from Nvidia') && 
         errorMessage.includes('ResourceExhausted');
+      
+      const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromStream;
 
       // Handle streaming errors - retry on rate limits, otherwise end stream
       if (isStreaming) {
-        if (isRateLimit && retryCount < maxRetries - 1) {
+        if ((isRateLimit || isNvidiaRateLimitFromStream) && retryCount < maxRetries - 1) {
           // Retry on rate limit for streaming too
           retryCount++;
           
