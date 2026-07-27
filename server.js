@@ -118,35 +118,50 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (error) {
       const isRateLimit = await keyManager.markKeyError(error);
 
-      // Handle streaming errors by ending the response
-      if (isStreaming && !res.writableEnded) {
-        res.write(`data: ${JSON.stringify({
-          error: {
-            message: error.message,
-            type: 'stream_error'
+      // Check if it's a NVIDIA rate limit (for delay)
+      const errorData = error.response?.data;
+      const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
+      const isNvidiaRateLimit = typeof errorMessage === 'string' && 
+        errorMessage.includes('Upstream error from Nvidia') && 
+        errorMessage.includes('ResourceExhausted');
+
+      // Handle streaming errors - retry on rate limits, otherwise end stream
+      if (isStreaming) {
+        if (isRateLimit && retryCount < maxRetries - 1) {
+          // Retry on rate limit for streaming too
+          retryCount++;
+          
+          // Add 1 second delay for NVIDIA rate limits
+          if (isNvidiaRateLimit) {
+            console.log('[Retry] NVIDIA rate limit hit on stream, waiting 1 second before retry...');
+            await new Promise(resolve => setTimeout(resolve, 1000));
           }
-        })}\n\n`);
-        res.end();
-        return;  // Exit the function completely
+          
+          // Continue to next iteration of while loop (retry)
+          continue;
+        }
+        
+        // Non-retryable error or max retries reached - end stream with error
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify({
+            error: {
+              message: error.message,
+              type: 'stream_error'
+            }
+          })}\n\n`);
+          res.end();
+        }
+        return;
       }
 
       // Only retry on rate limits or server errors
       if ((isRateLimit || error.response?.status >= 500) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Add 1 second delay for NVIDIA rate limits
-        if (isRateLimit) {
-          // Check if it's a NVIDIA-specific rate limit
-          const errorData = error.response?.data;
-          const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
-          const isNvidiaRateLimit = typeof errorMessage === 'string' && 
-            errorMessage.includes('Upstream error from Nvidia') && 
-            errorMessage.includes('ResourceExhausted');
-          
-          if (isNvidiaRateLimit) {
-            console.log('[Retry] NVIDIA rate limit hit, waiting 1 second before retry...');
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          }
+        // Add 1 second delay for NVIDIA rate limits (already detected above)
+        if (isRateLimit && isNvidiaRateLimit) {
+          console.log('[Retry] NVIDIA rate limit hit, waiting 1 second before retry...');
+          await new Promise(resolve => setTimeout(resolve, 1000));
         }
         continue;
       }
