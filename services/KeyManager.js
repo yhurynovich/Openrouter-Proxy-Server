@@ -32,7 +32,32 @@ class KeyManager {
       })[0];
 
       if (!key) {
-        const error = new Error('No available API keys');
+        // No keys available - calculate estimated wait time
+        const allKeys = await ApiKey.findAll({ isActive: true });
+        const now = new Date();
+        let minWaitMs = null;
+        
+        for (const k of allKeys) {
+          if (k.rateLimitResetAt && k.rateLimitResetAt > now) {
+            const waitMs = k.rateLimitResetAt.getTime() - now.getTime();
+            if (minWaitMs === null || waitMs < minWaitMs) {
+              minWaitMs = waitMs;
+            }
+          }
+        }
+        
+        let errorMessage = 'No available API keys';
+        if (minWaitMs !== null) {
+          const waitSeconds = Math.ceil(minWaitMs / 1000);
+          const waitMinutes = Math.ceil(waitSeconds / 60);
+          if (waitSeconds < 60) {
+            errorMessage += ` - try again in ~${waitSeconds} seconds`;
+          } else {
+            errorMessage += ` - try again in ~${waitMinutes} minute(s)`;
+          }
+        }
+        
+        const error = new Error(errorMessage);
         logError(error);
         throw error;
       }
