@@ -3,3 +3,7 @@
 node_modules
 logs
 data
+package-lock.json
+.mimocode/skills/council-code-review/scripts/council_review.py
+.mimocode/skills/council-code-review/SKILL.md
+package-lock.json

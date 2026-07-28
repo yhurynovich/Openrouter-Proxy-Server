@@ -76,10 +76,17 @@ class KeyManager {
     if (!error.response?.data) return false;
     
     const data = error.response.data;
-    // Check both OpenAI error format and raw text
+    // Check both OpenAI error format and raw text - safely stringify
+    const safeStringify = (obj) => {
+      try {
+        return JSON.stringify(obj);
+      } catch {
+        return String(obj);
+      }
+    };
     const errorMessage = data.error?.message || 
                          data.message || 
-                         JSON.stringify(data);
+                         safeStringify(data);
     
     return typeof errorMessage === 'string' && 
            errorMessage.includes('Upstream error from Nvidia') && 

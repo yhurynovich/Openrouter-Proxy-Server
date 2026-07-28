@@ -214,7 +214,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Check if it's a NVIDIA rate limit (for delay) - more robust detection
       const errorData = error.response?.data;
-      const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
+      const safeStringify = (obj) => {
+        try {
+          return JSON.stringify(obj);
+        } catch {
+          return String(obj);
+        }
+      };
+      const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       const isNvidiaRateLimitFromResponse = typeof errorMessage === 'string' && 
         errorMessage.includes('Upstream error from Nvidia') && 
         (errorMessage.includes('ResourceExhausted') || 
