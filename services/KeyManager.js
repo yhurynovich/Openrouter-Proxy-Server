@@ -83,7 +83,9 @@ class KeyManager {
     
     return typeof errorMessage === 'string' && 
            errorMessage.includes('Upstream error from Nvidia') && 
-           errorMessage.includes('ResourceExhausted');
+           (errorMessage.includes('ResourceExhausted') || 
+            errorMessage.includes('rate limit') ||
+            errorMessage.includes('limit reached'));
   }
 
   async markKeyError(error) {

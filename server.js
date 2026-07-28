@@ -67,18 +67,53 @@ async function handleStreamingResponse(axiosResponse, res) {
   let nvidiaRateLimitDetected = false;
 
   for await (const chunk of axiosResponse.data) {
-    // Check for NVIDIA rate limit error in stream chunks
-    buffer += chunk.toString();
+    const chunkStr = chunk.toString();
+    buffer += chunkStr;
     
-    // Look for the NVIDIA error in SSE data format
-    if (buffer.includes('Upstream error from Nvidia') && buffer.includes('ResourceExhausted')) {
-      nvidiaRateLimitDetected = true;
-      console.log('[Stream] NVIDIA rate limit detected in stream chunks');
-      // Don't write this error to client - we'll throw to trigger retry
-      break;
+    // Parse SSE format: each event is separated by \n\n
+    // Each event has "data: " prefix
+    const events = buffer.split('\n\n');
+    
+    // Keep the last incomplete event in buffer
+    buffer = events.pop() || '';
+    
+    for (const event of events) {
+      // Check if this is a data event
+      if (event.startsWith('data: ')) {
+        const dataStr = event.slice(6).trim(); // Remove "data: " prefix
+        
+        // Check for [DONE] marker
+        if (dataStr === '[DONE]') {
+          res.write(chunkStr);
+          continue;
+        }
+        
+        try {
+          const data = JSON.parse(dataStr);
+          
+          // Check for NVIDIA rate limit error in the chunk
+          if (data.error && data.error.message) {
+            const errorMsg = data.error.message;
+            if (typeof errorMsg === 'string' && 
+                errorMsg.includes('Upstream error from Nvidia') && 
+                errorMsg.includes('ResourceExhausted')) {
+              nvidiaRateLimitDetected = true;
+              console.log('[Stream] NVIDIA rate limit detected in SSE chunk:', errorMsg);
+              break; // Stop processing, will throw error after loop
+            }
+          }
+        } catch (e) {
+          // Not valid JSON, just forward it
+        }
+      }
+      
+      // Write the event to client
+      res.write(event + '\n\n');
     }
     
-    res.write(chunk);
+    if (nvidiaRateLimitDetected) {
+      break;
+    }
   }
   
   if (nvidiaRateLimitDetected) {
@@ -86,6 +121,11 @@ async function handleStreamingResponse(axiosResponse, res) {
     const error = new Error('NVIDIA rate limit in stream');
     error.isNvidiaRateLimit = true;
     throw error;
+  }
+  
+  // Write any remaining buffer
+  if (buffer) {
+    res.write(buffer);
   }
   
   res.end();
@@ -132,12 +172,19 @@ app.post('/v1/chat/completions', async (req, res) => {
       const responseData = response.data;
       if (responseData?.error?.message) {
         const errorMessage = responseData.error.message;
+        
+        // Robust NVIDIA rate limit detection - multiple patterns
         const isNvidiaRateLimit = typeof errorMessage === 'string' && 
-          errorMessage.includes('Upstream error from Nvidia') && 
-          errorMessage.includes('ResourceExhausted');
+          (errorMessage.includes('Upstream error from Nvidia') || 
+           errorMessage.includes('upstream error from nvidia')) && 
+          (errorMessage.includes('ResourceExhausted') || 
+           errorMessage.includes('resource exhausted') ||
+           errorMessage.includes('Worker local total request limit reached') ||
+           errorMessage.includes('rate limit') ||
+           errorMessage.includes('Resource Exhausted'));
         
         if (isNvidiaRateLimit) {
-          console.log('[Response] NVIDIA rate limit detected in response body');
+          console.log('[Response] NVIDIA rate limit detected:', errorMessage.substring(0, 200));
           // Create an error that will be caught by the catch block
           const error = new Error('NVIDIA rate limit in response');
           error.response = {
@@ -165,12 +212,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       const isRateLimit = await keyManager.markKeyError(error);
 
-      // Check if it's a NVIDIA rate limit (for delay)
+      // Check if it's a NVIDIA rate limit (for delay) - more robust detection
       const errorData = error.response?.data;
       const errorMessage = errorData?.error?.message || errorData?.message || JSON.stringify(errorData);
       const isNvidiaRateLimitFromResponse = typeof errorMessage === 'string' && 
         errorMessage.includes('Upstream error from Nvidia') && 
-        errorMessage.includes('ResourceExhausted');
+        (errorMessage.includes('ResourceExhausted') || 
+         errorMessage.includes('rate limit') ||
+         errorMessage.includes('limit reached'));
       
       const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromStream;
 
