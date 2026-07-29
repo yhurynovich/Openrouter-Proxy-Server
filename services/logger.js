@@ -1,89 +1,133 @@
 import winston from 'winston';
 import 'winston-daily-rotate-file';
 import path from 'path';
+import fs from 'fs/promises';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
 // Import sanitize utility
 import { sanitizeRequest } from './utils/sanitize.js';
 
-// Create logs directory if it doesn't exist
-const logsDir = 'logs';
+// Load logger configuration
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const configPath = path.join(__dirname, '../config/logger.json');
+let loggerConfig = {
+  logLevel: 'warning',
+  console: { enabled: true, colorize: true },
+  file: { enabled: true, directory: 'logs', maxSize: '20m', maxFiles: '14d' },
+  categories: { request: 'warning', error: 'error', key: 'info', stream: 'info' }
+};
 
-// Configure transport for requests
-const requestTransport = new winston.transports.DailyRotateFile({
-  filename: path.join(logsDir, 'requests-%DATE%.log'),
-  datePattern: 'YYYY-MM-DD',
-  maxSize: '20m',
-  maxFiles: '14d',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  )
+try {
+  const configData = await fs.readFile(configPath, 'utf8');
+  loggerConfig = { ...loggerConfig, ...JSON.parse(configData) };
+} catch (error) {
+  // Use defaults if config not found
+}
+
+// Ensure logs directory exists
+const logsDir = path.join(__dirname, '..', loggerConfig.file.directory);
+await fs.mkdir(logsDir, { recursive: true });
+
+// Log level priority: error=0, warning=1, info=2, debug=3
+const levelPriority = { error: 0, warning: 1, info: 2, debug: 3 };
+const globalLevelPriority = levelPriority[loggerConfig.logLevel] ?? 1;
+
+// Logger level should be the most permissive to allow all messages to reach transports
+// Transports will do the actual filtering
+const loggerLevel = 'info'; // Allow all messages to pass to transports
+
+// Custom formatter that adds [LEVEL] prefix
+const customFormat = winston.format.printf(({ level, message, timestamp, ...metadata }) => {
+  let metaStr = '';
+  if (Object.keys(metadata).length > 0) {
+    metaStr = ' ' + JSON.stringify(metadata);
+  }
+  return `${timestamp} [${level.toUpperCase()}] ${message}${metaStr}`;
 });
 
-// Configure transport for errors
-const errorTransport = new winston.transports.DailyRotateFile({
-  filename: path.join(logsDir, 'errors-%DATE%.log'),
-  datePattern: 'YYYY-MM-DD',
-  maxSize: '20m',
-  maxFiles: '14d',
-  level: 'error',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  )
-});
+// Create transports based on config
+const transports = [];
 
-// Configure transport for key management
-const keyTransport = new winston.transports.DailyRotateFile({
-  filename: path.join(logsDir, 'keys-%DATE%.log'),
-  datePattern: 'YYYY-MM-DD',
-  maxSize: '20m',
-  maxFiles: '14d',
-  format: winston.format.combine(
-    winston.format.timestamp(),
-    winston.format.json()
-  )
-});
+if (loggerConfig.file.enabled) {
+  transports.push(
+    new winston.transports.DailyRotateFile({
+      filename: path.join(logsDir, 'requests-%DATE%.log'),
+      datePattern: 'YYYY-MM-DD',
+      maxSize: loggerConfig.file.maxSize,
+      maxFiles: loggerConfig.file.maxFiles,
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        customFormat
+      ),
+      level: loggerConfig.categories.request
+    }),
+    new winston.transports.DailyRotateFile({
+      filename: path.join(logsDir, 'errors-%DATE%.log'),
+      datePattern: 'YYYY-MM-DD',
+      maxSize: loggerConfig.file.maxSize,
+      maxFiles: loggerConfig.file.maxFiles,
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        customFormat
+      ),
+      level: loggerConfig.categories.error
+    }),
+    new winston.transports.DailyRotateFile({
+      filename: path.join(logsDir, 'keys-%DATE%.log'),
+      datePattern: 'YYYY-MM-DD',
+      maxSize: loggerConfig.file.maxSize,
+      maxFiles: loggerConfig.file.maxFiles,
+      format: winston.format.combine(
+        winston.format.timestamp(),
+        customFormat
+      ),
+      level: loggerConfig.categories.key
+    })
+  );
+}
 
-// Create loggers
-export const requestLogger = winston.createLogger({
-  transports: [
-    requestTransport,
+if (loggerConfig.console.enabled) {
+  transports.push(
     new winston.transports.Console({
       format: winston.format.combine(
         winston.format.colorize(),
-        winston.format.simple()
-      )
+        winston.format.timestamp(),
+        customFormat
+      ),
+      level: loggerConfig.logLevel
     })
-  ]
+  );
+}
+
+// Create loggers with permissive level to let transports filter
+export const requestLogger = winston.createLogger({
+  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('requests')),
+  level: loggerLevel
 });
 
 export const errorLogger = winston.createLogger({
-  transports: [
-    errorTransport,
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      )
-    })
-  ]
+  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('errors')),
+  level: loggerLevel
 });
 
 export const keyLogger = winston.createLogger({
-  transports: [
-    keyTransport,
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      )
-    })
-  ]
+  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('keys')),
+  level: loggerLevel
 });
+
+// Helper function to check if should log at level (for performance optimization)
+const shouldLog = (categoryLevel) => {
+  return levelPriority[categoryLevel] <= globalLevelPriority;
+};
+
+// Also check if any transport would log this level (for early return optimization)
+const shouldLogAny = (categoryLevel) => {
+  return levelPriority[categoryLevel] <= globalLevelPriority;
+};
 
 // Helper function to log streaming chunks
 export const logStreamChunk = (requestId, chunk) => {
+  if (!shouldLog('info')) return;
   try {
     const data = chunk.toString();
     requestLogger.info('Stream Chunk', {
@@ -100,20 +144,20 @@ export const requestLoggingMiddleware = (req, res, next) => {
   const startTime = Date.now();
   const requestId = crypto.randomUUID();
 
-  
+  // Log request if level allows
+  if (shouldLog(loggerConfig.categories.request)) {
+    const sanitizedRequest = sanitizeRequest({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body: req.body,
+    });
 
-  // Log request
-  const sanitizedRequest = sanitizeRequest({
-    method: req.method,
-    url: req.url,
-    headers: req.headers,
-    body: req.body,
-  });
-
-  requestLogger.info('Incoming Request', {
-    requestId,
-    ...sanitizedRequest,
-  });
+    requestLogger.info('Incoming Request', {
+      requestId,
+      ...sanitizedRequest,
+    });
+  }
 
   // Track if this is a streaming request
   const isStreaming = req.body?.stream === true;
@@ -121,25 +165,26 @@ export const requestLoggingMiddleware = (req, res, next) => {
   // Override res.json for non-streaming responses
   const originalJson = res.json;
   res.json = function(data) {
-    // Check if response already sent to avoid "Cannot set headers after they are sent"
     if (res.headersSent) {
       return originalJson.apply(this, arguments);
     }
     
-    const responseTime = Date.now() - startTime;
-    
-    const sanitizedResponse = sanitizeRequest({
-      statusCode: res.statusCode,
-      responseTime,
-      headers: res.getHeaders(),
-      body: data,
-    });
+    if (shouldLog(loggerConfig.categories.request)) {
+      const responseTime = Date.now() - startTime;
+      
+      const sanitizedResponse = sanitizeRequest({
+        statusCode: res.statusCode,
+        responseTime,
+        headers: res.getHeaders(),
+        body: data,
+      });
 
-    requestLogger.info('Outgoing Response', {
-      requestId,
-      ...sanitizedResponse,
-      streaming: false
-    });
+      requestLogger.info('Outgoing Response', {
+        requestId,
+        ...sanitizedResponse,
+        streaming: false
+      });
+    }
 
     return originalJson.apply(this, arguments);
   };
@@ -150,20 +195,24 @@ export const requestLoggingMiddleware = (req, res, next) => {
     const originalEnd = res.end;
 
     res.write = function(chunk) {
-      logStreamChunk(requestId, chunk);
+      if (shouldLog(loggerConfig.categories.stream)) {
+        logStreamChunk(requestId, chunk);
+      }
       return originalWrite.apply(this, arguments);
     };
 
     res.end = function(chunk) {
-      if (chunk) {
+      if (chunk && shouldLog(loggerConfig.categories.stream)) {
         logStreamChunk(requestId, chunk);
       }
-      const responseTime = Date.now() - startTime;
-      requestLogger.info('Stream Ended', {
-        requestId,
-        responseTime,
-        streaming: true
-      });
+      if (shouldLog(loggerConfig.categories.request)) {
+        const responseTime = Date.now() - startTime;
+        requestLogger.info('Stream Ended', {
+          requestId,
+          responseTime,
+          streaming: true
+        });
+      }
       return originalEnd.apply(this, arguments);
     };
   }
@@ -173,6 +222,7 @@ export const requestLoggingMiddleware = (req, res, next) => {
 
 // Helper function to log key management events
 export const logKeyEvent = (event, details) => {
+  if (!shouldLog('info')) return;
   keyLogger.info(event, details);
 };
 
