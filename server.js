@@ -140,7 +140,7 @@ async function handleStreamingResponse(axiosResponse, res) {
                 errorMsg.includes('ResourceExhausted')) {
               nvidiaRateLimitDetected = true;
               console.log('[Stream] NVIDIA rate limit detected in SSE chunk:', errorMsg);
-              break; // Stop processing, will throw error after loop
+              break; // Stop processing, will handle after loop
             }
           }
         } catch (e) {
@@ -158,10 +158,19 @@ async function handleStreamingResponse(axiosResponse, res) {
   }
   
   if (nvidiaRateLimitDetected) {
-    // Throw error to trigger retry logic
-    const error = new Error('NVIDIA rate limit in stream');
-    error.isNvidiaRateLimit = true;
-    throw error;
+    // Don't throw - write error to stream and end gracefully
+    // This allows the retry logic in the caller to work properly
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({
+        error: {
+          message: 'NVIDIA rate limit exceeded',
+          type: 'stream_error'
+        }
+      })}\n\n`);
+      res.end();
+    }
+    // Return a special value to indicate rate limit was handled
+    return { rateLimitHandled: true };
   }
   
   // Write any remaining buffer
@@ -194,6 +203,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const maxRetries = 3;
   let retryCount = 0;
   const isStreaming = req.body?.stream === true;
+  let isNvidiaRateLimitFromStream = false;
 
   while (retryCount < maxRetries) {
     try {
@@ -255,13 +265,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Handle streaming response differently
       if (isStreaming) {
-        return handleStreamingResponse(response, res);
+        const streamResult = await handleStreamingResponse(response, res);
+        // Check if NVIDIA rate limit was handled in streaming
+        if (streamResult?.rateLimitHandled) {
+          // Set a flag to trigger retry logic
+          isNvidiaRateLimitFromStream = true;
+        }
+        return;
       }
 
       return res.json(responseData);
     } catch (error) {
       // Check if NVIDIA rate limit was detected in stream chunks
-      const isNvidiaRateLimitFromStream = error.isNvidiaRateLimit === true;
+      const isNvidiaRateLimitFromError = error.isNvidiaRateLimit === true;
       
       const isRateLimit = await keyManager.markKeyError(error);
 
@@ -281,7 +297,7 @@ app.post('/v1/chat/completions', async (req, res) => {
          errorMessage.includes('rate limit') ||
          errorMessage.includes('limit reached'));
       
-      const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromStream;
+      const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromError || isNvidiaRateLimitFromStream;
 
       // Handle streaming errors - retry on rate limits, otherwise end stream
       if (isStreaming) {
