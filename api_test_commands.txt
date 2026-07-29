@@ -1,0 +1,34 @@
+# Health check                                                                                                                                   
+curl -s http://localhost:3000/health                                                                                                             
+                                                                                                                                                 
+# List available models                                                                                                                          
+curl -s http://localhost:3000/v1/models                                                                                                          
+                                                                                                                                                 
+# Non-streaming chat completion                                                                                                                  
+curl -s -X POST http://localhost:3000/v1/chat/completions \                                                                                      
+  -H "Content-Type: application/json" \                                                                                                          
+  -d '{"model": "nvidia/nemotron-3-ultra-550b-a55b:free", "messages": [{"role": "user", "content": "What is 2+2?"}], "stream": false}'           
+                                                                                                                                                 
+# Streaming chat completion                                                                                                                      
+curl -s -N -X POST http://localhost:3000/v1/chat/completions \                                                                                   
+  -H "Content-Type: application/json" \                                                                                                          
+  -d '{"model": "nvidia/nemotron-3-ultra-550b-a55b:free", "messages": [{"role": "user", "content": "Count to 3"}], "stream": true}'              
+                                                                                                                                                 
+# Admin: Add API key (requires ADMIN_SECRET in .env)                                                                                             
+curl -s -X POST http://localhost:3000/admin/keys \                                                                                               
+  -H "Content-Type: application/json" \                                                                                                          
+  -H "x-admin-secret: test123" \                                                                                                                 
+  -d '{"key": "sk-or-v1-your-key-here"}'                                                                                                         
+                                                                                                                                                 
+# Admin: Add API key without auth (should return 401)                                                                                            
+curl -s -X POST http://localhost:3000/admin/keys \                                                                                               
+  -H "Content-Type: application/json" \                                                                                                          
+  -d '{"key": "sk-test"}'                                                                                                                        
+                                                                                                                                                 
+Test different free models:                                                                                                                      
+                                                                                                                                                 
+# NVIDIA models                                                                                                                                  
+curl -s -X POST http://localhost:3000/v1/chat/completions \                                                                                      
+  -H "Content-Type: application/json" \                                                                                                          
+  -d '{"model": "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", "messages": [{"role": "user", "content": "Hello"}], "stream": false}'      
+
