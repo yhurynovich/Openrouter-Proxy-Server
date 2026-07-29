@@ -139,7 +139,10 @@ async function handleStreamingResponse(axiosResponse, res) {
                 errorMsg.includes('Upstream error from Nvidia') && 
                 errorMsg.includes('ResourceExhausted')) {
               nvidiaRateLimitDetected = true;
-              console.log('[Stream] NVIDIA rate limit detected in SSE chunk:', errorMsg);
+              logError(new Error('NVIDIA rate limit detected in SSE chunk'), { 
+                context: 'Stream', 
+                errorMessage: errorMsg 
+              });
               break; // Stop processing, will handle after loop
             }
           }
@@ -247,7 +250,10 @@ app.post('/v1/chat/completions', async (req, res) => {
            errorMessage.includes('Resource Exhausted'));
         
         if (isNvidiaRateLimit) {
-          console.log('[Response] NVIDIA rate limit detected:', errorMessage.substring(0, 200));
+          logError(new Error('NVIDIA rate limit detected in response'), { 
+            context: 'Response', 
+            errorMessage: errorMessage.substring(0, 200) 
+          });
           // Create an error that will be caught by the catch block
           const error = new Error('NVIDIA rate limit in response');
           error.response = {
