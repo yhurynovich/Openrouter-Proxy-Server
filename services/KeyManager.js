@@ -32,7 +32,14 @@ class KeyManager {
       })[0];
 
       if (!key) {
-        // No keys available - calculate estimated wait time
+        // No keys available - attempt to reactivate all keys first
+        const reactivated = await this.reactivateAllKeys();
+        if (reactivated) {
+          // Try to get a key again after reactivation
+          return await this.rotateKey();
+        }
+        
+        // No keys available even after reactivation - calculate estimated wait time
         const allKeys = await ApiKey.findAll({ isActive: true });
         const now = new Date();
         let minWaitMs = null;
@@ -216,6 +223,40 @@ class KeyManager {
     } catch (error) {
       logError(error, { action: 'addKey' });
       throw error;
+    }
+  }
+
+  /**
+   * Reactivate all inactive keys and clear rate limit cooldowns
+   * Called when no keys are available to give them a second chance
+   * @returns {boolean} true if any keys were reactivated, false otherwise
+   */
+  async reactivateAllKeys() {
+    try {
+      const allKeys = await ApiKey.findAll({});
+      let reactivated = 0;
+      
+      for (const key of allKeys) {
+        if (!key.isActive || key.rateLimitResetAt) {
+          key.isActive = true;
+          key.failureCount = 0;
+          key.rateLimitResetAt = null;
+          await key.save();
+          reactivated++;
+        }
+      }
+      
+      if (reactivated > 0) {
+        logKeyEvent('Bulk Key Reactivation', {
+          reactivatedCount: reactivated,
+          totalKeys: allKeys.length
+        });
+      }
+      
+      return reactivated > 0;
+    } catch (error) {
+      logError(error, { action: 'reactivateAllKeys' });
+      return false;
     }
   }
 }
