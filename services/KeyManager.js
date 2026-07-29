@@ -4,6 +4,7 @@ import { logKeyEvent, logError } from './logger.js';
 class KeyManager {
   constructor() {
     this.currentKey = null;
+    this.rotationLock = false;
   }
 
   async initialize() {
@@ -12,7 +13,23 @@ class KeyManager {
     }
   }
 
-  async rotateKey() {
+  async rotateKey(depth = 0) {
+    // Prevent infinite recursion
+    if (depth > 2) {
+      const error = new Error('Max key rotation depth exceeded - no available keys');
+      logError(error);
+      throw error;
+    }
+
+    // Prevent concurrent rotations (race condition)
+    if (this.rotationLock) {
+      // Wait for the other rotation to complete
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return this.rotateKey(depth);
+    }
+
+    this.rotationLock = true;
+    
     try {
       // Get a working key that's not in cooldown
       // Get all keys and filter/sort manually
@@ -36,7 +53,8 @@ class KeyManager {
         const reactivated = await this.reactivateAllKeys();
         if (reactivated) {
           // Try to get a key again after reactivation
-          return await this.rotateKey();
+          this.rotationLock = false;
+          return await this.rotateKey(depth + 1);
         }
         
         // No keys available even after reactivation - calculate estimated wait time
@@ -64,6 +82,7 @@ class KeyManager {
           }
         }
         
+        this.rotationLock = false;
         const error = new Error(errorMessage);
         logError(error);
         throw error;
@@ -78,8 +97,10 @@ class KeyManager {
         failureCount: key.failureCount
       });
 
+      this.rotationLock = false;
       return key.key;
     } catch (error) {
+      this.rotationLock = false;
       logError(error, { action: 'rotateKey' });
       throw error;
     }
@@ -132,7 +153,7 @@ class KeyManager {
 
     try {
       // Check if it's a rate limit error (HTTP 429)
-      const isHttpRateLimit = error.response?.status === 429;
+      const isHttpRateLimit = error.response && error.response.status === 429;
       
       // Check for NVIDIA-specific rate limit in response body
       const isNvidiaRateLimit = this.isNvidiaRateLimitError(error);
@@ -140,8 +161,35 @@ class KeyManager {
       const isRateLimit = isHttpRateLimit || isNvidiaRateLimit;
 
       if (isRateLimit) {
-        const resetTime = error.response.headers['x-ratelimit-reset'];
-        this.currentKey.rateLimitResetAt = resetTime ? new Date(resetTime * 1000) : new Date(Date.now() + 60000);
+        // OpenRouter uses 'ratelimit-reset' header (lowercase, no x- prefix)
+        const resetTime = error.response?.headers?.['ratelimit-reset'] || error.response?.headers?.['x-ratelimit-reset'];
+        console.log('[KeyManager] Rate limit reset header:', resetTime);
+        let resetDate;
+        if (resetTime) {
+          const resetNum = parseInt(resetTime, 10);
+          // Detect format:
+          // - > 1e13: seconds with padded zeros (e.g., 1785369600000 = 1785369600 seconds)
+          // - > 1e12: milliseconds since epoch
+          // - > 1e9: seconds since epoch
+          // - else: relative seconds from now
+          if (resetNum > 1e13) {
+            // Seconds with 3 padded zeros (OpenRouter format)
+            resetDate = new Date((resetNum / 1000) * 1000);
+          } else if (resetNum > 1e12) {
+            // Milliseconds since epoch
+            resetDate = new Date(resetNum);
+          } else if (resetNum > 1e9) {
+            // Seconds since epoch
+            resetDate = new Date(resetNum * 1000);
+          } else {
+            // Relative seconds from now
+            resetDate = new Date(Date.now() + resetNum * 1000);
+          }
+        } else {
+          resetDate = new Date(Date.now() + 60000);
+        }
+        console.log('[KeyManager] Parsed reset date:', resetDate);
+        this.currentKey.rateLimitResetAt = resetDate;
         
         logKeyEvent('Rate Limit Hit', {
           keyId: this.currentKey._id,
@@ -167,9 +215,16 @@ class KeyManager {
         });
         // Clear current key to force rotation
         this.currentKey = null;
+        // Auto-rotate to next available key
+        try {
+          await this.rotateKey();
+        } catch (rotateError) {
+          logError(rotateError, { action: 'autoRotateAfterDeactivation' });
+        }
+      } else {
+        await this.currentKey.save();
       }
-
-      await this.currentKey.save();
+      
       return false; // Indicate it was not a rate limit error
     } catch (error) {
       logError(error, { 
@@ -239,7 +294,9 @@ class KeyManager {
       for (const key of allKeys) {
         if (!key.isActive || key.rateLimitResetAt) {
           key.isActive = true;
-          key.failureCount = 0;
+          // Graduated reset: reduce failure count but don't clear completely
+          // This preserves some history of problematic keys
+          key.failureCount = Math.max(0, key.failureCount - 2);
           key.rateLimitResetAt = null;
           await key.save();
           reactivated++;

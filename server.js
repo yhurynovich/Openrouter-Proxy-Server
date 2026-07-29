@@ -1,6 +1,8 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import axios from 'axios';
+import rateLimit from 'express-rate-limit';
+import https from 'https';
 import keyManager from './services/KeyManager.js';
 import { requestLoggingMiddleware, logError } from './services/logger.js';
 import { fileURLToPath } from 'url';
@@ -8,8 +10,35 @@ import { dirname, join } from 'path';
 
 dotenv.config();
 
+// Create axios instance with connection pooling
+const keepaliveAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+  freeSocketTimeout: 30000
+});
+
+const axiosInstance = axios.create({
+  httpsAgent: keepaliveAgent,
+  timeout: 120000,
+});
+
 const app = express();
-app.use(express.json({ limit: '50mb' }));
+
+// Reduce body limit to prevent DoS
+app.use(express.json({ limit: '5mb' }));
+
+// Rate limiting middleware (100 requests per minute per IP)
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: { message: 'Too many requests, please try again later', type: 'rate_limit_exceeded' } }
+});
+app.use(limiter);
+
 app.use(requestLoggingMiddleware);
 
 // Create logs directory
@@ -42,8 +71,20 @@ const initializeKeys = async () => {
 // Wait for initialization before accepting requests
 await initializeKeys();
 
+// Admin authentication middleware
+const ADMIN_SECRET = process.env.ADMIN_SECRET;
+const adminAuth = (req, res, next) => {
+  if (!ADMIN_SECRET) {
+    return res.status(503).json({ error: 'Admin secret not configured' });
+  }
+  if (req.headers['x-admin-secret'] !== ADMIN_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
+
 // Admin endpoint to add new API keys
-app.post('/admin/keys', async (req, res) => {
+app.post('/admin/keys', adminAuth, async (req, res) => {
   try {
     const { key } = req.body;
     if (!key) {
@@ -131,8 +172,25 @@ async function handleStreamingResponse(axiosResponse, res) {
   res.end();
 }
 
+// Create connection pool agent for axios
+import { Agent } from 'https';
+const httpAgent = new Agent({ keepAlive: true, maxSockets: 50 });
+
 // OpenRouter proxy endpoint
 app.post('/v1/chat/completions', async (req, res) => {
+  // Validate request body
+  if (!req.body) {
+    return res.status(400).json({
+      error: { message: 'Request body is required', type: 'bad_request' }
+    });
+  }
+  
+  if (!req.body.model || !Array.isArray(req.body.messages) || req.body.messages.length === 0) {
+    return res.status(400).json({
+      error: { message: 'Invalid request: model and non-empty messages array required', type: 'bad_request' }
+    });
+  }
+  
   const maxRetries = 3;
   let retryCount = 0;
   const isStreaming = req.body?.stream === true;
@@ -150,7 +208,6 @@ app.post('/v1/chat/completions', async (req, res) => {
           'X-Title': process.env.SITE_NAME || 'OpenRouterProxy'
         },
         timeout: 120000,  // 2 minute timeout
-        trust_env: false  // Ignore environment proxy settings
       };
 
       // Add responseType: 'stream' for streaming requests
@@ -158,11 +215,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         axiosConfig.responseType = 'stream';
       }
 
-      // Add timeout and trust_env for all requests
-      axiosConfig.timeout = 120000;  // 2 minute timeout
-      axiosConfig.trust_env = false;
-
-      const response = await axios.post(
+      const response = await axiosInstance.post(
         'https://openrouter.ai/api/v1/chat/completions',
         req.body,
         axiosConfig
@@ -294,6 +347,23 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
+// Health check endpoint
+let isReady = false;
+initializeKeys().then(() => {
+  isReady = true;
+}).catch(err => {
+  console.error('Key initialization failed:', err);
+  // Server still starts but health will report not ready
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    status: isReady ? 'ready' : 'not ready',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime()
+  });
+});
+
 // Models endpoint
 app.get('/v1/models', async (req, res) => {
   const maxRetries = 3;
@@ -309,10 +379,9 @@ app.get('/v1/models', async (req, res) => {
           'X-Title': process.env.SITE_NAME || 'OpenRouterProxy'
         },
         timeout: 30000,  // 30 second timeout
-        trust_env: false
       };
 
-      const response = await axios.get(
+      const response = await axiosInstance.get(
         'https://openrouter.ai/api/v1/models',
         axiosConfig
       );
@@ -360,6 +429,34 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`OpenRouter Proxy Server running on port ${PORT}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+  
+  // Force close after 10 seconds
+  setTimeout(() => {
+    console.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
+});
+
+process.on('SIGINT', async () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  server.close(() => {
+    console.log('HTTP server closed');
+    process.exit(0);
+  });
+  
+  setTimeout(() => {
+    console.error('Could not close connections in time, forcefully shutting down');
+    process.exit(1);
+  }, 10000);
 });

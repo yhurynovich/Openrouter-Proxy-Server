@@ -1,6 +1,7 @@
 import winston from 'winston';
 import 'winston-daily-rotate-file';
 import path from 'path';
+import crypto from 'crypto';
 // Import sanitize utility
 import { sanitizeRequest } from './utils/sanitize.js';
 
@@ -97,7 +98,7 @@ export const logStreamChunk = (requestId, chunk) => {
 // Middleware for logging requests and responses
 export const requestLoggingMiddleware = (req, res, next) => {
   const startTime = Date.now();
-  const requestId = Math.random().toString(36).substring(7);
+  const requestId = crypto.randomUUID();
 
   
 
@@ -120,6 +121,11 @@ export const requestLoggingMiddleware = (req, res, next) => {
   // Override res.json for non-streaming responses
   const originalJson = res.json;
   res.json = function(data) {
+    // Check if response already sent to avoid "Cannot set headers after they are sent"
+    if (res.headersSent) {
+      return originalJson.apply(this, arguments);
+    }
+    
     const responseTime = Date.now() - startTime;
     
     const sanitizedResponse = sanitizeRequest({

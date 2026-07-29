@@ -1,30 +1,40 @@
 export const sanitizeRequest = (request) => {
-  const sanitized = JSON.parse(JSON.stringify(request)); // Deep clone
+  // Use structuredClone for deep clone (handles circular refs, BigInt, etc)
+  // Fallback to JSON for older environments
+  const sanitized = (typeof structuredClone === 'function')
+    ? structuredClone(request)
+    : (() => {
+        try {
+          return JSON.parse(JSON.stringify(request));
+        } catch {
+          // If circular ref or other issue, return a safe minimal object
+          return { ...request };
+        }
+      })();
   
-  // Redact Authorization header
-  if (sanitized.headers?.Authorization) {
-    sanitized.headers.Authorization = 'REDACTED';
-  }
+  // Recursively redact sensitive fields
+  const redact = (obj, path = '') => {
+    if (!obj || typeof obj !== 'object') return obj;
+    
+    if (Array.isArray(obj)) {
+      return obj.map((item, i) => redact(item, `${path}[${i}]`));
+    }
+    
+    const result = { ...obj };
+    for (const [k, v] of Object.entries(result)) {
+      const fullPath = path ? `${path}.${k}` : k;
+      const lowerKey = k.toLowerCase();
+      
+      // Redact known sensitive keys
+      if (['authorization', 'x-api-key', 'apikey', 'api_key', 'key', 'apikey'].includes(lowerKey)) {
+        result[k] = 'REDACTED';
+      } else if (typeof v === 'object' && v !== null) {
+        // Recurse into nested objects
+        result[k] = redact(v, fullPath);
+      }
+    }
+    return result;
+  };
   
-  // Redact x-api-key header
-  if (sanitized.headers?.['x-api-key']) {
-    sanitized.headers['x-api-key'] = 'REDACTED';
-  }
-
-  // Redact any apiKey in body
-  if (sanitized.body?.apiKey) {
-    sanitized.body.apiKey = 'REDACTED';
-  }
-  
-  // Redact api_key in body (OpenRouter format)
-  if (sanitized.body?.api_key) {
-    sanitized.body.api_key = 'REDACTED';
-  }
-  
-  // Redact key in body (other formats)
-  if (sanitized.body?.key) {
-    sanitized.body.key = 'REDACTED';
-  }
-
-  return sanitized;
+  return redact(sanitized);
 };

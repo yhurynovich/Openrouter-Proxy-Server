@@ -23,7 +23,9 @@ class ApiKey {
           return key.rateLimitResetAt === null;
         }
         if (condition.rateLimitResetAt?.$lte) {
-          return !key.rateLimitResetAt || new Date(key.rateLimitResetAt) <= new Date();
+          // $lte should only match actual dates, not null/undefined
+          if (!key.rateLimitResetAt) return false;
+          return new Date(key.rateLimitResetAt) <= new Date();
         }
         return false;
       });
@@ -79,7 +81,9 @@ class ApiKey {
   }
 
   static async #writeKeys(keys) {
-    await fs.writeFile(KEYS_FILE, JSON.stringify(keys, null, 2));
+    const tmpFile = KEYS_FILE + '.tmp';
+    await fs.writeFile(tmpFile, JSON.stringify(keys, null, 2));
+    await fs.rename(tmpFile, KEYS_FILE); // atomic on POSIX
   }
 }
 
