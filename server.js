@@ -7,8 +7,18 @@ import keyManager from './services/KeyManager.js';
 import { requestLoggingMiddleware, logError } from './services/logger.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { mkdir } from 'fs/promises';
 
 dotenv.config();
+
+// Create logs directory
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const logsDir = join(__dirname, 'logs');
+try {
+  await mkdir(logsDir, { recursive: true });
+} catch (error) {
+  console.error('Error creating logs directory:', error);
+}
 
 // Create axios instance with connection pooling
 const keepaliveAgent = new https.Agent({
@@ -40,16 +50,6 @@ const limiter = rateLimit({
 app.use(limiter);
 
 app.use(requestLoggingMiddleware);
-
-// Create logs directory
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const logsDir = join(__dirname, 'logs');
-import { mkdir } from 'fs/promises';
-try {
-  await mkdir(logsDir, { recursive: true });
-} catch (error) {
-  console.error('Error creating logs directory:', error);
-}
 
 // Initialize with default key(s) if provided
 const initializeKeys = async () => {

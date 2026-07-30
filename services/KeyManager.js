@@ -188,7 +188,7 @@ class KeyManager {
         } else {
           resetDate = new Date(Date.now() + 60000);
         }
-        console.log('[KeyManager] Parsed reset date:', resetDate);
+        console.log('[KeyManager] Parsed reset date: UTC:', resetDate.toISOString(), 'Local:', resetDate.toString());
         this.currentKey.rateLimitResetAt = resetDate;
         
         logKeyEvent('Rate Limit Hit', {
