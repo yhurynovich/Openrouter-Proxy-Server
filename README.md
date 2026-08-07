@@ -12,6 +12,7 @@ When using OpenRouter's free models like DeepSeek Chat, you often encounter rate
 2. **Keeping Services Running**: Tools like Aider and Roo-Code can keep working without interruption
 3. **Handling Failures Gracefully**: Smart retry logic and automatic recovery from errors
 4. **Being OpenAI Compatible**: Works as a drop-in replacement - just change the base URL
+5. **Anthropic Compatible**: Supports `/v1/messages` endpoint for Anthropic SDK users
 
 ## Quick Start
 
@@ -36,6 +37,13 @@ const openai = new OpenAI({
   apiKey: 'dummy-key'  // Real keys managed by proxy
 });
 ```
+- For Anthropic SDK:
+```javascript
+const anthropic = new Anthropic({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key'  // Real keys managed by proxy
+});
+```
 
 [![Node.js Version](https://img.shields.io/badge/node-%3E%3D16-brightgreen)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/license-MIT-blue)]()
@@ -46,8 +54,16 @@ const openai = new OpenAI({
 |-------------------------------|---------------------------|-----------------------------|--------------------------|
 | Smart API key rotation         | Full streaming support    | Comprehensive logging       | Timing-safe auth         |
 | Sticky session optimization    | Automatic retry logic     | Daily log rotation          | Admin rate limiting      |
-| JSON-based storage             | Connection management     | Error tracking              | Header injection protection |
+| JSON-based storage             | Connection management     | Error tracking (file + console) | Header injection protection |
 | Rate limit handling            | Chunk processing          | Key status monitoring       | Abort on client disconnect |
+| **Auto model ID normalization**| **Multi-modal support**   | **Error logs to file + console** | **Request validation** |
+
+| **API Compatibility** 🔄      | **Developer Experience** 🛠 |
+|-------------------------------|----------------------------|
+| OpenAI `/v1/chat/completions` | Auto model ID normalization |
+| Anthropic `/v1/messages`      | Request validation (OpenAI schema) |
+| OpenAI `/v1/models`           | Client header forwarding |
+| Tool/function calling         | Structured error responses |
 
 ## 🛠 Configuration
 
@@ -119,9 +135,11 @@ curl -X POST http://localhost:3000/admin/keys \
 node server.js
 ```
 
+On startup, the server automatically fetches the model list from OpenRouter and builds the model ID normalization mapping. This happens in parallel with key initialization.
+
 ## 🚀 Usage Examples
 
-### JavaScript Client
+### JavaScript Client (OpenAI)
 ```javascript
 const openai = new OpenAI({
   baseURL: 'http://localhost:3000/v1',
@@ -140,7 +158,21 @@ for await (const chunk of stream) {
 }
 ```
 
-### cURL Example
+### JavaScript Client (Anthropic)
+```javascript
+const anthropic = new Anthropic({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key' // Actual key managed by proxy
+});
+
+const message = await anthropic.messages.create({
+  model: 'deepseek/deepseek-chat:free',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: 'Hello' }],
+});
+```
+
+### cURL Example (OpenAI)
 ```bash
 curl -X POST http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -149,6 +181,65 @@ curl -X POST http://localhost:3000/v1/chat/completions \
     "model": "deepseek/deepseek-chat:free",
     "messages": [{"role": "user", "content": "Hello"}]
   }'
+```
+
+### cURL Example (Anthropic)
+```bash
+curl -X POST http://localhost:3000/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy-key" \
+  -d '{
+    "model": "deepseek/deepseek-chat:free",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+### Tool/Function Calling Example
+```javascript
+const openai = new OpenAI({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key'
+});
+
+const response = await openai.chat.completions.create({
+  model: 'deepseek/deepseek-chat:free',
+  messages: [{ role: 'user', content: 'What is the weather in San Francisco?' }],
+  tools: [{
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get current weather',
+      parameters: {
+        type: 'object',
+        properties: {
+          location: { type: 'string', description: 'City name' }
+        },
+        required: ['location']
+      }
+    }
+  }],
+  tool_choice: 'auto'
+});
+```
+
+### Multi-Modal (Image) Example
+```javascript
+const openai = new OpenAI({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key'
+});
+
+const response = await openai.chat.completions.create({
+  model: 'google/gemini-pro-vision',
+  messages: [{
+    role: 'user',
+    content: [
+      { type: 'text', text: 'What is in this image?' },
+      { type: 'image_url', image_url: { url: 'https://example.com/image.jpg' } }
+    ]
+  }]
+});
 ```
 
 ## 🔄 Key Rotation Strategy
@@ -193,6 +284,28 @@ The key rotation system implements:
 - **Thread-Safe Mutex**: Uses promise-based mutex to prevent race conditions during rotation
 - **Graceful Reactivation**: Bulk key reactivation with graduated failure reduction
 
+## 🤖 Auto Model ID Normalization
+
+On startup, the server automatically fetches the model list from OpenRouter and builds a dynamic mapping from OpenRouter model IDs to OpenAI-compatible format:
+
+| OpenRouter ID | Normalized |
+|---------------|------------|
+| `openai/gpt-4o` | `gpt-4o` |
+| `anthropic/claude-3.5-sonnet` | `claude-3.5-sonnet` |
+| `meta-llama/llama-3.1-405b` | `llama-3.1-405b` |
+| `deepseek/deepseek-chat:free` | `deepseek-chat` |
+| `new-provider/new-model` | `new-model` (auto) |
+
+**Benefits:**
+- **Zero maintenance** - New models automatically supported
+- **Provider-agnostic** - Works for any provider
+- **Auto-removes `:free`** suffix
+- **Handles edge cases** via minimal fallback map
+- **Cached in memory** - Fast lookups after startup
+- **Self-updates** on every server restart
+
+The `/v1/models` endpoint returns normalized model IDs in OpenAI format.
+
 ## 🔒 Security Features
 
 - **Timing-Safe Comparison**: Admin secret uses `crypto.timingSafeEqual()` with length validation
@@ -202,6 +315,7 @@ The key rotation system implements:
 - **Request Sanitization**: Automatic redaction of sensitive fields in logs
 - **Abort on Disconnect**: Upstream requests cancelled when client disconnects
 - **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Referrer-Policy
+- **Request Validation**: Full OpenAI Chat Completions schema validation
 
 ## 📊 Observability
 
@@ -211,8 +325,10 @@ The key rotation system implements:
 - `logs/keys-%DATE%.log`: Key rotation events
 - `logs/streams-%DATE%.log`: Stream chunk logs (debug level)
 
+**Error logs go to BOTH file and console** - Critical errors are always visible in console regardless of log level setting.
+
 ### Log Levels
-- **error**: Errors and critical issues
+- **error**: Errors and critical issues (always in console + file)
 - **warning**: Important events (default)
 - **info**: Key events, successes
 - **debug**: Stream chunks, detailed tracing
@@ -225,10 +341,25 @@ The key rotation system implements:
 
 ### API Reference
 
-#### Chat Completions
+#### Chat Completions (OpenAI)
 `POST /v1/chat/completions`
 - OpenAI-compatible chat completions endpoint
 - Supports both streaming and non-streaming responses
+- Auto-retries on rate limits (max 3 attempts)
+- Full request validation (OpenAI schema)
+- Tool/function calling support
+- Multi-modal (image) support
+- Headers:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer dummy-key` (actual key managed by proxy)
+  - `X-Request-ID`: Added for distributed tracing
+  - `HTTP-Referer`, `X-Title`: Forwarded from client if provided
+
+#### Messages (Anthropic)
+`POST /v1/messages`
+- Anthropic-compatible messages endpoint
+- Translates Anthropic format → OpenAI → OpenRouter → Anthropic
+- Supports system parameter, tool use, streaming
 - Auto-retries on rate limits (max 3 attempts)
 - Headers:
   - `Content-Type: application/json`
@@ -239,6 +370,7 @@ The key rotation system implements:
 `GET /v1/models`
 - Retrieves available models from OpenRouter
 - Auto-retries on rate limits (max 3 attempts)
+- Returns normalized model IDs in OpenAI format
 - Headers:
   - `Authorization: Bearer dummy-key`
 
@@ -281,10 +413,11 @@ graph TD
 
 3. **Logging System** (`services/logger.js`)
    - Request logging middleware
-   - Error tracking
+   - Error tracking (file + console)
    - Key event monitoring
    - Stream chunk logging (debug level)
    - Explicit Winston transports per category
+   - Dedicated error console transport
 
 4. **Stream Handler** (`server.js` - `handleStreamingResponse`)
    - Manages SSE connections
@@ -352,7 +485,7 @@ graph TD
 
 ### Logs Location
 - `logs/requests-%DATE%.log`: Request/response details
-- `logs/errors-%DATE%.log`: Error stack traces
+- `logs/errors-%DATE%.log`: Error stack traces (also in console)
 - `logs/keys-%DATE%.log`: Key rotation events
 - `logs/streams-%DATE%.log`: Stream chunk logs
 
@@ -382,12 +515,14 @@ The codebase has been through multiple rounds of automated code review using the
 - AbortController for upstream cancellation
 - Named constants replacing magic numbers
 - Explicit Winston transports
+- **Error logs to both file and console**
 
 ### Edge Cases Handled
 - Client disconnect aborts upstream
 - Buffer overflow clean error handling
 - Stream data sent flag prevents duplicate retries
 - Proper exit codes on failure
+- Automated model ID normalization
 
 ## 📜 License
 MIT © Adrian Belmans - See [LICENSE](LICENSE) for details

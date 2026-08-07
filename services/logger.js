@@ -90,6 +90,7 @@ const streamTransport = new winston.transports.DailyRotateFile({
   level: loggerConfig.categories.stream
 });
 
+// Console transports - separate for general and error logs
 const consoleTransport = loggerConfig.console.enabled ? new winston.transports.Console({
   format: winston.format.combine(
     winston.format.colorize(),
@@ -99,6 +100,16 @@ const consoleTransport = loggerConfig.console.enabled ? new winston.transports.C
   level: loggerConfig.logLevel
 }) : null;
 
+// Dedicated error console transport - ensures errors always appear in console
+const errorConsoleTransport = loggerConfig.console.enabled ? new winston.transports.Console({
+  format: winston.format.combine(
+    winston.format.colorize(),
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: 'error' // Always log errors to console
+}) : null;
+
 // Create loggers with explicit transports
 export const requestLogger = winston.createLogger({
   transports: [requestTransport].concat(consoleTransport ? [consoleTransport] : []),
@@ -106,7 +117,7 @@ export const requestLogger = winston.createLogger({
 });
 
 export const errorLogger = winston.createLogger({
-  transports: [errorTransport].concat(consoleTransport ? [consoleTransport] : []),
+  transports: [errorTransport].concat(errorConsoleTransport ? [errorConsoleTransport] : []),
   level: 'info'
 });
 

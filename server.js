@@ -19,28 +19,15 @@ function sanitizeHeaderValue(value) {
   return value.replace(/[\r\n]/g, '').substring(0, 500);
 }
 
-// Model ID Normalization
-// Maps OpenRouter model IDs to OpenAI-compatible format
-const MODEL_ID_MAPPING = {
-  // OpenRouter -> Standard mapping
-  'openai/gpt-4o': 'gpt-4o',
-  'openai/gpt-4o-mini': 'gpt-4o-mini',
-  'openai/gpt-4-turbo': 'gpt-4-turbo',
-  'openai/gpt-4': 'gpt-4',
-  'openai/gpt-3.5-turbo': 'gpt-3.5-turbo',
-  'anthropic/claude-3.5-sonnet': 'claude-3.5-sonnet',
-  'anthropic/claude-3-opus': 'claude-3-opus',
-  'anthropic/claude-3-haiku': 'claude-3-haiku',
-  'google/gemini-pro': 'gemini-pro',
-  'google/gemini-pro-vision': 'gemini-pro-vision',
-  'meta-llama/llama-3.1-405b': 'llama-3.1-405b',
-  'meta-llama/llama-3.1-70b': 'llama-3.1-70b',
-  'meta-llama/llama-3.1-8b': 'llama-3.1-8b',
-  'mistralai/mistral-large': 'mistral-large',
-  'mistralai/mistral-nemo': 'mistral-nemo',
-  'cohere/command-r-plus': 'command-r-plus',
-  'cohere/command-r': 'command-r',
-  // Free models
+// Model ID Normalization - Automated
+// Fetches models from OpenRouter and builds dynamic mapping
+let modelIdMapping = new Map();
+let modelIdMappingLoaded = false;
+let modelIdMappingPromise = null;
+
+// Known fallback mappings for edge cases (models that don't follow provider/model pattern)
+const FALLBACK_MODEL_MAPPING = {
+  // Free models with :free suffix
   'deepseek/deepseek-chat:free': 'deepseek-chat',
   'deepseek/deepseek-coder:free': 'deepseek-coder',
   'nvidia/nemotron-3-ultra-550b-a55b:free': 'nemotron-3-ultra',
@@ -60,6 +47,94 @@ const MODEL_ID_MAPPING = {
 };
 
 /**
+ * Build model ID mapping from OpenRouter model list
+ * @param {Array} models - OpenRouter models array
+ * @returns {Map} Mapping of OpenRouter ID -> normalized ID
+ */
+function buildModelIdMapping(models) {
+  const mapping = new Map();
+  
+  if (!Array.isArray(models)) {
+    return mapping;
+  }
+  
+  for (const model of models) {
+    if (!model || !model.id) continue;
+    
+    const openRouterId = model.id;
+    let normalizedId = null;
+    
+    // Check fallback mappings first
+    if (FALLBACK_MODEL_MAPPING[openRouterId]) {
+      normalizedId = FALLBACK_MODEL_MAPPING[openRouterId];
+    }
+    // Try to extract base model name from provider/model format
+    else {
+      const parts = openRouterId.split('/');
+      if (parts.length === 2) {
+        const baseName = parts[1];
+        // Remove :free suffix if present
+        normalizedId = baseName.replace(/:free$/, '');
+      } else if (parts.length === 1) {
+        // Already a simple name
+        normalizedId = openRouterId;
+      }
+    }
+    
+    if (normalizedId) {
+      mapping.set(openRouterId, normalizedId);
+    }
+  }
+  
+  return mapping;
+}
+
+/**
+ * Fetch and build model ID mapping from OpenRouter
+ * @returns {Promise<Map>} Model ID mapping
+ */
+async function fetchAndBuildModelIdMapping() {
+  if (modelIdMappingLoaded) {
+    return modelIdMapping;
+  }
+  
+  // Return existing promise if already fetching
+  if (modelIdMappingPromise) {
+    return modelIdMappingPromise;
+  }
+  
+  modelIdMappingPromise = (async () => {
+    try {
+      // Use a temporary axios instance without auth for model fetching
+      const tempAxios = axios.create({
+        timeout: 10000,
+        httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
+      });
+      
+      const response = await tempAxios.get('https://openrouter.ai/api/v1/models');
+      
+      if (response.data && response.data.data) {
+        modelIdMapping = buildModelIdMapping(response.data.data);
+        modelIdMappingLoaded = true;
+        logError(new Error('Model ID mapping loaded'), { 
+          context: 'ModelMapping', 
+          count: modelIdMapping.size 
+        });
+      }
+    } catch (error) {
+      logError(error, { context: 'ModelMapping fetch failed' });
+      // Return empty map on failure - will use fallback logic
+      modelIdMapping = new Map();
+      modelIdMappingLoaded = true;
+    }
+    
+    return modelIdMapping;
+  })();
+  
+  return modelIdMappingPromise;
+}
+
+/**
  * Normalize OpenRouter model ID to OpenAI-compatible format
  * @param {string} openRouterId - OpenRouter model ID
  * @returns {string} Normalized model ID
@@ -69,9 +144,14 @@ function normalizeModelId(openRouterId) {
     return openRouterId;
   }
   
-  // Check direct mapping first
-  if (MODEL_ID_MAPPING[openRouterId]) {
-    return MODEL_ID_MAPPING[openRouterId];
+  // Check dynamic mapping first (if loaded)
+  if (modelIdMappingLoaded && modelIdMapping.has(openRouterId)) {
+    return modelIdMapping.get(openRouterId);
+  }
+  
+  // Check fallback mappings
+  if (FALLBACK_MODEL_MAPPING[openRouterId]) {
+    return FALLBACK_MODEL_MAPPING[openRouterId];
   }
   
   // Try to extract base model name from provider/model format
@@ -85,6 +165,17 @@ function normalizeModelId(openRouterId) {
   
   // Return as-is if no mapping found
   return openRouterId;
+}
+
+/**
+ * Initialize model ID mapping on startup
+ */
+async function initializeModelIdMapping() {
+  try {
+    await fetchAndBuildModelIdMapping();
+  } catch (error) {
+    logError(error, { context: 'ModelMapping init failed' });
+  }
 }
 
 /**
@@ -581,7 +672,7 @@ const initializeKeys = async () => {
 let isReady = false;
 // Wait for initialization before accepting requests
 try {
-  await initializeKeys();
+  await Promise.all([initializeKeys(), initializeModelIdMapping()]);
   isReady = true;
 } catch (error) {
   logError(error, { context: 'Key initialization' });
