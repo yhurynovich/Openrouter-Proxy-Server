@@ -30,8 +30,8 @@ export const sanitizeRequest = (request) => {
       const fullPath = path ? `${path}.${k}` : k;
       const lowerKey = k.toLowerCase();
       
-      // Redact known sensitive keys (specific patterns only, not generic 'key')
-      if (['authorization', 'x-api-key', 'apikey', 'api_key', 'secret', 'password', 'token', 'access_token', 'refresh_token'].includes(lowerKey)) {
+      // Redact known sensitive keys (specific patterns including generic 'key')
+      if (['authorization', 'x-api-key', 'apikey', 'api_key', 'key', 'secret', 'password', 'token', 'access_token', 'refresh_token', 'admin_secret', 'x-admin-secret'].includes(lowerKey)) {
         result[k] = 'REDACTED';
       } else if (typeof v === 'object' && v !== null) {
         // Recurse into nested objects

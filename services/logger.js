@@ -237,6 +237,12 @@ export const logKeyEvent = (event, details) => {
   keyLogger.info(event, details);
 };
 
+// Helper function to log informational events (non-error)
+export const logInfo = (message, context = {}) => {
+  const sanitizedContext = sanitizeRequest(context);
+  keyLogger.info(message, sanitizedContext);
+};
+
 // Helper function to log errors
 export const logError = (error, context = {}) => {
   // Sanitize context to prevent sensitive data leakage

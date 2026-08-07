@@ -3,9 +3,10 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import rateLimit from 'express-rate-limit';
 import https from 'https';
+import http from 'http';
 import { timingSafeEqual, randomUUID } from 'crypto';
 import keyManager, { KeyManager } from './services/KeyManager.js';
-import { requestLoggingMiddleware, logError } from './services/logger.js';
+import { requestLoggingMiddleware, logError, logInfo } from './services/logger.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdir } from 'fs/promises';
@@ -18,6 +19,31 @@ function sanitizeHeaderValue(value) {
   // Strip newlines and carriage returns, limit length
   return value.replace(/[\r\n]/g, '').substring(0, 500);
 }
+
+// Configuration constants
+const CONFIG = {
+  PORT: process.env.PORT || 3000,
+  BODY_LIMIT: process.env.BODY_LIMIT || '5mb',
+  MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || '100000', 10),
+  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
+  RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
+  AXIOS_TIMEOUT: parseInt(process.env.AXIOS_TIMEOUT || '120000', 10),
+  AXIOS_MAX_SOCKETS: parseInt(process.env.AXIOS_MAX_SOCKETS || '50', 10),
+  AXIOS_MAX_FREE_SOCKETS: parseInt(process.env.AXIOS_MAX_FREE_SOCKETS || '10', 10),
+  AXIOS_KEEPALIVE_TIMEOUT: parseInt(process.env.AXIOS_KEEPALIVE_TIMEOUT || '60000', 10),
+  AXIOS_FREE_SOCKET_TIMEOUT: parseInt(process.env.AXIOS_FREE_SOCKET_TIMEOUT || '30000', 10),
+  // New: Idle timeout for upstream connections (default 30s)
+  AXIOS_IDLE_TIMEOUT: parseInt(process.env.AXIOS_IDLE_TIMEOUT || '30000', 10),
+  MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '3', 10),
+  RETRY_DELAY_MS: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
+  SSE_BUFFER_LIMIT: parseInt(process.env.SSE_BUFFER_LIMIT || String(10 * 1024 * 1024), 10),
+  MODELS_TIMEOUT: parseInt(process.env.MODELS_TIMEOUT || '30000', 10),
+  HTTP_REFERER: process.env.HTTP_REFERER || 'http://localhost:3000',
+  SITE_NAME: process.env.SITE_NAME || 'OpenRouterProxy',
+  // Admin endpoint stricter rate limiting
+  ADMIN_RATE_LIMIT_WINDOW_MS: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '60000', 10),
+  ADMIN_RATE_LIMIT_MAX: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10', 10)
+};
 
 // Model ID Normalization - Automated
 // Fetches models from OpenRouter and builds dynamic mapping
@@ -116,7 +142,7 @@ async function fetchAndBuildModelIdMapping() {
       if (response.data && response.data.data) {
         modelIdMapping = buildModelIdMapping(response.data.data);
         modelIdMappingLoaded = true;
-        logError(new Error('Model ID mapping loaded'), { 
+        logInfo('Model ID mapping loaded', { 
           context: 'ModelMapping', 
           count: modelIdMapping.size 
         });
@@ -165,6 +191,59 @@ function normalizeModelId(openRouterId) {
   
   // Return as-is if no mapping found
   return openRouterId;
+}
+
+/**
+ * Normalize model object from OpenRouter to OpenAI format
+ * @param {Object} model - OpenRouter model object
+ * @returns {Object} Normalized model object
+ */
+function normalizeModelObject(model) {
+  if (!model || typeof model !== 'object') {
+    return model;
+  }
+  
+  const normalized = { ...model };
+  
+  // Normalize ID
+  if (normalized.id) {
+    normalized.id = normalizeModelId(normalized.id);
+  }
+  
+  // Ensure required OpenAI fields
+  if (!normalized.object) {
+    normalized.object = 'model';
+  }
+  
+  if (!normalized.owned_by) {
+    // Extract owner from original ID
+    const parts = (model.id || '').split('/');
+    if (parts.length === 2) {
+      normalized.owned_by = parts[0];
+    } else {
+      normalized.owned_by = 'openrouter';
+    }
+  }
+  
+  // Ensure created timestamp
+  if (!normalized.created) {
+    normalized.created = Math.floor(Date.now() / 1000);
+  }
+  
+  // Add empty permission array if missing (OpenAI format)
+  if (!normalized.permission) {
+    normalized.permission = [];
+  }
+  
+  // Add root and parent if missing
+  if (!normalized.root && normalized.id) {
+    normalized.root = normalized.id;
+  }
+  if (!normalized.parent) {
+    normalized.parent = null;
+  }
+  
+  return normalized;
 }
 
 /**
@@ -574,29 +653,6 @@ function validateChatCompletionRequest(body) {
   };
 }
 
-// Configuration constants
-const CONFIG = {
-  PORT: process.env.PORT || 3000,
-  BODY_LIMIT: process.env.BODY_LIMIT || '5mb',
-  MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || '100000', 10),
-  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
-  RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
-  AXIOS_TIMEOUT: parseInt(process.env.AXIOS_TIMEOUT || '120000', 10),
-  AXIOS_MAX_SOCKETS: parseInt(process.env.AXIOS_MAX_SOCKETS || '50', 10),
-  AXIOS_MAX_FREE_SOCKETS: parseInt(process.env.AXIOS_MAX_FREE_SOCKETS || '10', 10),
-  AXIOS_KEEPALIVE_TIMEOUT: parseInt(process.env.AXIOS_KEEPALIVE_TIMEOUT || '60000', 10),
-  AXIOS_FREE_SOCKET_TIMEOUT: parseInt(process.env.AXIOS_FREE_SOCKET_TIMEOUT || '30000', 10),
-  MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '3', 10),
-  RETRY_DELAY_MS: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
-  SSE_BUFFER_LIMIT: parseInt(process.env.SSE_BUFFER_LIMIT || String(10 * 1024 * 1024), 10),
-  MODELS_TIMEOUT: parseInt(process.env.MODELS_TIMEOUT || '30000', 10),
-  HTTP_REFERER: process.env.HTTP_REFERER || 'http://localhost:3000',
-  SITE_NAME: process.env.SITE_NAME || 'OpenRouterProxy',
-  // Admin endpoint stricter rate limiting
-  ADMIN_RATE_LIMIT_WINDOW_MS: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '60000', 10),
-  ADMIN_RATE_LIMIT_MAX: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10', 10)
-};
-
 // Create logs directory
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const logsDir = join(__dirname, 'logs');
@@ -612,12 +668,20 @@ const keepaliveAgent = new https.Agent({
   maxSockets: CONFIG.AXIOS_MAX_SOCKETS,
   maxFreeSockets: CONFIG.AXIOS_MAX_FREE_SOCKETS,
   timeout: CONFIG.AXIOS_KEEPALIVE_TIMEOUT,
-  freeSocketTimeout: CONFIG.AXIOS_FREE_SOCKET_TIMEOUT
+  freeSocketTimeout: CONFIG.AXIOS_FREE_SOCKET_TIMEOUT,
+  // New: Set idle timeout to prevent upstream idle timeout
+  keepAliveMsecs: CONFIG.AXIOS_IDLE_TIMEOUT,
 });
 
 const axiosInstance = axios.create({
   httpsAgent: keepaliveAgent,
   timeout: CONFIG.AXIOS_TIMEOUT,
+  // New: HTTP agent with idle timeout for HTTP connections
+  httpAgent: new http.Agent({ 
+    keepAlive: true, 
+    maxSockets: CONFIG.AXIOS_MAX_SOCKETS,
+    keepAliveMsecs: CONFIG.AXIOS_IDLE_TIMEOUT,
+  }),
 });
 
 const app = express();
@@ -774,12 +838,12 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
           
           if (data.error && data.error.message) {
             const errorMsg = data.error.message;
-            const isNvidiaRateLimit = KeyManager.isNvidiaRateLimitError({
+            const isRateLimit = KeyManager.isRateLimitError({
               response: { data: data, status: 200, headers: {} }
             });
-            if (typeof errorMsg === 'string' && isNvidiaRateLimit) {
+            if (typeof errorMsg === 'string' && isRateLimit) {
               nvidiaRateLimitDetected = true;
-              logError(new Error('NVIDIA rate limit detected in SSE chunk'), { 
+              logInfo('Rate limit detected in SSE chunk', { 
                 context: 'Stream', 
                 errorMessage: errorMsg 
               });
@@ -917,8 +981,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (responseData?.error?.message) {
         const errorMessage = responseData.error.message;
         
-        // Use centralized NVIDIA rate limit detection
-        const isNvidiaRateLimit = KeyManager.isNvidiaRateLimitError({
+        // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
+        const isRateLimit = KeyManager.isRateLimitError({
           response: {
             data: responseData,
             status: 200,
@@ -926,19 +990,19 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
         });
         
-        if (isNvidiaRateLimit) {
-          logError(new Error('NVIDIA rate limit detected in response'), { 
+        if (isRateLimit) {
+          logInfo('Rate limit detected in response', { 
             context: 'Response', 
             errorMessage: errorMessage.substring(0, 200) 
           });
           // Create an error that will be caught by the catch block
-          const error = new Error('NVIDIA rate limit in response');
+          const error = new Error('Rate limit in response');
           error.response = {
             data: responseData,
             status: 200,
             headers: response.headers
           };
-          error.isNvidiaRateLimit = true;
+          error.isRateLimit = true;
           throw error;
         }
         
@@ -969,9 +1033,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       return res.json(responseData);
     } catch (error) {
       
-      const isRateLimit = await keyManager.markKeyError(error);
+      const keyRateLimit = await keyManager.markKeyError(error);
 
-      // Check if it's a NVIDIA rate limit (for delay) - more robust detection
+      // Check if it's a rate limit (for delay) - more robust detection
       const errorData = error.response?.data;
       const safeStringify = (obj) => {
         try {
@@ -982,8 +1046,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
       const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       
-      // Use centralized NVIDIA rate limit detection
-      const isNvidiaRateLimitFromResponse = KeyManager.isNvidiaRateLimitError({
+      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
+      const isRateLimitFromResponse = KeyManager.isRateLimitError({
         response: {
           data: errorData,
           status: error.response?.status,
@@ -991,25 +1055,53 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       });
       
-      const isNvidiaRateLimitFromError = error.isNvidiaRateLimit === true;
-      const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromError;
+      const isRateLimitFromError = error.isRateLimit === true;
+      const isRateLimit = isRateLimitFromResponse || isRateLimitFromError;
+      
+      // Check for network errors that should trigger a retry
+      const isNetworkError = error.code && (
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNABORTED' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ENETUNREACH' ||
+        error.code === 'EAI_AGAIN' ||
+        error.code === 'EHOSTUNREACH' ||
+        error.code === 'EPIPE' ||
+        error.code === 'ECONNREFUSED'
+      );
+      
+      // Check for idle timeout in error message
+      const isIdleTimeout = errorMessage && (
+        errorMessage.toLowerCase().includes('idle timeout') ||
+        errorMessage.toLowerCase().includes('upstream idle timeout') ||
+        errorMessage.toLowerCase().includes('connection timeout') ||
+        errorMessage.toLowerCase().includes('connection closed') ||
+        errorMessage.toLowerCase().includes('socket hang up')
+      );
+      
+      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
-      // Handle streaming errors - retry on rate limits, otherwise end stream
+      // Handle streaming errors - retry on rate limits or network errors, otherwise end stream
       if (isStreaming) {
         // Don't retry if we've already sent data to the client (would cause duplicate/interleaved streams)
         if (streamDataSent) {
-          logError(new Error('[Stream] Data already sent, skipping retry to avoid duplicate streams'), {
+          logInfo('[Stream] Data already sent, skipping retry to avoid duplicate streams', {
             context: 'Stream Retry',
             streamDataSent: true
           });
-        } else if ((isRateLimit || isNvidiaRateLimit) && retryCount < maxRetries - 1) {
-          // Retry on rate limit for streaming too
+        } else if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+          // Retry on rate limit or network errors for streaming too
           retryCount++;
           
-          // Add delay for NVIDIA rate limits
-          if (isNvidiaRateLimit) {
-            const msg = `[Retry] NVIDIA rate limit hit on stream, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-            logError(new Error(msg), { context: 'Stream Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+          // Add delay for rate limits
+          if (isRateLimit) {
+            const msg = `[Retry] Rate limit hit on stream, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+            await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+          } else if (shouldRetryForNetwork) {
+            const msg = `[Retry] Network error on stream: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
             await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
           }
           
@@ -1025,14 +1117,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // Only retry on rate limits or server errors
-      if ((isRateLimit || error.response?.status >= 500) && retryCount < maxRetries - 1) {
+      // Only retry on rate limits, server errors, or network errors
+      if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Add delay for NVIDIA rate limits (already detected above)
-        if (isRateLimit && isNvidiaRateLimit) {
-          const msg = `[Retry] NVIDIA rate limit hit, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-          logError(new Error(msg), { context: 'Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+        // Add delay for rate limits
+        if (isRateLimit) {
+          const msg = `[Retry] Rate limit hit, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+          logInfo(msg, { context: 'Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+          await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+        } else if (shouldRetryForNetwork) {
+          const msg = `[Retry] Network error: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+          logInfo(msg, { context: 'Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
           await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
         }
         continue;
@@ -1208,7 +1304,8 @@ app.post('/v1/messages', async (req, res) => {
       if (responseData?.error?.message) {
         const errorMessage = responseData.error.message;
         
-        const isNvidiaRateLimit = KeyManager.isNvidiaRateLimitError({
+        // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
+        const isRateLimit = KeyManager.isRateLimitError({
           response: {
             data: responseData,
             status: 200,
@@ -1216,14 +1313,14 @@ app.post('/v1/messages', async (req, res) => {
           }
         });
         
-        if (isNvidiaRateLimit) {
-          logError(new Error('NVIDIA rate limit detected in response'), { 
+        if (isRateLimit) {
+          logInfo('Rate limit detected in response', { 
             context: 'Anthropic Response', 
             errorMessage: errorMessage.substring(0, 200) 
           });
-          const error = new Error('NVIDIA rate limit in response');
+          const error = new Error('Rate limit in response');
           error.response = { data: responseData, status: 200, headers: response.headers };
-          error.isNvidiaRateLimit = true;
+          error.isRateLimit = true;
           throw error;
         }
         
@@ -1295,7 +1392,7 @@ app.post('/v1/messages', async (req, res) => {
       return res.json(anthropicResponse);
       
     } catch (error) {
-      const isRateLimit = await keyManager.markKeyError(error);
+      const keyRateLimit = await keyManager.markKeyError(error);
       
       const errorData = error.response?.data;
       const safeStringify = (obj) => {
@@ -1303,18 +1400,47 @@ app.post('/v1/messages', async (req, res) => {
       };
       const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       
-      const isNvidiaRateLimitFromResponse = KeyManager.isNvidiaRateLimitError({
+      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
+      const isRateLimitFromResponse = KeyManager.isRateLimitError({
         response: { data: errorData, status: error.response?.status, headers: error.response?.headers }
       });
       
-      const isNvidiaRateLimitFromError = error.isNvidiaRateLimit === true;
-      const isNvidiaRateLimit = isNvidiaRateLimitFromResponse || isNvidiaRateLimitFromError;
+      const isRateLimitFromError = error.isRateLimit === true;
+      const isRateLimit = isRateLimitFromResponse || isRateLimitFromError;
       
-      if ((isRateLimit || isNvidiaRateLimit) && retryCount < maxRetries - 1) {
+      // Check for network errors that should trigger a retry
+      const isNetworkError = error.code && (
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNABORTED' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ENETUNREACH' ||
+        error.code === 'EAI_AGAIN' ||
+        error.code === 'EHOSTUNREACH' ||
+        error.code === 'EPIPE' ||
+        error.code === 'ECONNREFUSED'
+      );
+      
+      // Check for idle timeout in error message
+      const isIdleTimeout = errorMessage && (
+        errorMessage.toLowerCase().includes('idle timeout') ||
+        errorMessage.toLowerCase().includes('upstream idle timeout') ||
+        errorMessage.toLowerCase().includes('connection timeout') ||
+        errorMessage.toLowerCase().includes('connection closed') ||
+        errorMessage.toLowerCase().includes('socket hang up')
+      );
+      
+      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
+
+      if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
-        if (isNvidiaRateLimit) {
-          const msg = `[Retry] NVIDIA rate limit hit on Anthropic, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-          logError(new Error(msg), { context: 'Anthropic Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+        if (isRateLimit) {
+          const msg = `[Retry] Rate limit hit on Anthropic, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
+          await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+        } else if (shouldRetryForNetwork) {
+          const msg = `[Retry] Network error on Anthropic: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
+          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
           await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
         }
         continue;

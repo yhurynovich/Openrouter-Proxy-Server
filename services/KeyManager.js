@@ -191,6 +191,76 @@ class KeyManager {
   }
 
   /**
+   * Check if an error response contains any rate limit error
+   * Handles NVIDIA, Xiaomi MiMo, and generic rate limit patterns
+   */
+  static isRateLimitError(error) {
+    if (!error.response?.data) return false;
+    
+    const data = error.response.data;
+    const safeStringify = (obj) => {
+      try {
+        return JSON.stringify(obj);
+      } catch {
+        return String(obj);
+      }
+    };
+    const errorMessage = data.error?.message || 
+                         data.message || 
+                         safeStringify(data);
+    
+    if (typeof errorMessage !== 'string') return false;
+    
+    const lowerMessage = errorMessage.toLowerCase();
+    
+    // NVIDIA rate limits
+    if (lowerMessage.includes('upstream error from nvidia') && 
+        (lowerMessage.includes('resourceexhausted') || 
+         lowerMessage.includes('rate limit') ||
+         lowerMessage.includes('limit reached'))) {
+      return true;
+    }
+    
+    // Xiaomi MiMo studio rate limits
+    if (lowerMessage.includes('xiaomi') || lowerMessage.includes('mimo')) {
+      if (lowerMessage.includes('rate limit') || 
+          lowerMessage.includes('quota exceeded') ||
+          lowerMessage.includes('too many requests') ||
+          lowerMessage.includes('rate limited') ||
+          lowerMessage.includes('throttl') ||
+          lowerMessage.includes('idle timeout') ||
+          lowerMessage.includes('upstream idle timeout')) {
+        return true;
+      }
+    }
+    
+    // Generic rate limit patterns (OpenRouter, OpenAI, Anthropic, etc.)
+    if (lowerMessage.includes('rate limit') || 
+        lowerMessage.includes('quota exceeded') ||
+        lowerMessage.includes('too many requests') ||
+        lowerMessage.includes('rate limited') ||
+        lowerMessage.includes('throttl') ||
+        lowerMessage.includes('429') ||
+        (lowerMessage.includes('limit') && lowerMessage.includes('exceeded'))) {
+      return true;
+    }
+    
+    // Idle timeout patterns
+    if (lowerMessage.includes('idle timeout') || 
+        lowerMessage.includes('connection timeout') ||
+        lowerMessage.includes('upstream idle timeout') ||
+        lowerMessage.includes('connection closed') ||
+        lowerMessage.includes('socket hang up') ||
+        lowerMessage.includes('econnreset') ||
+        lowerMessage.includes('etimedout') ||
+        lowerMessage.includes('econnaborted')) {
+      return true;
+    }
+    
+    return false;
+  }
+
+  /**
    * Parse rate limit reset header from OpenRouter response
    * Handles multiple formats: seconds with padded zeros, milliseconds, seconds, or relative seconds
    * @param {Object} headers - Response headers
@@ -235,10 +305,10 @@ class KeyManager {
       // Check if it's a rate limit error (HTTP 429)
       const isHttpRateLimit = error.response && error.response.status === 429;
       
-      // Check for NVIDIA-specific rate limit in response body
-      const isNvidiaRateLimit = KeyManager.isNvidiaRateLimitError(error);
+      // Check for any rate limit error (NVIDIA, Xiaomi MiMo, generic, idle timeout)
+      const isRateLimitError = KeyManager.isRateLimitError(error);
       
-      const isRateLimit = isHttpRateLimit || isNvidiaRateLimit;
+      const isRateLimit = isHttpRateLimit || isRateLimitError;
 
       if (isRateLimit) {
         // OpenRouter uses 'ratelimit-reset' header (lowercase, no x- prefix)
@@ -252,7 +322,7 @@ class KeyManager {
         logKeyEvent('Rate Limit Hit', {
           keyId: this.currentKey._id,
           resetTime: this.currentKey.rateLimitResetAt,
-          isNvidia: isNvidiaRateLimit
+          isNvidia: isRateLimitError && error.message?.includes?.('Nvidia') || false
         });
 
         await this.currentKey.save();
