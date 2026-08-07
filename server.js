@@ -1056,8 +1056,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
       
       const isRateLimitFromError = error.isRateLimit === true;
-      const isRateLimit = isRateLimitFromResponse || isRateLimitFromError;
       
+      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
+      // Combine with other detection methods for robustness
+      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
+      
+      // Calculate retry delay with exponential backoff
+      const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
+
       // Check for network errors that should trigger a retry
       const isNetworkError = error.code && (
         error.code === 'ECONNRESET' ||
@@ -1084,26 +1090,28 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Handle streaming errors - retry on rate limits or network errors, otherwise end stream
       if (isStreaming) {
-        // Don't retry if we've already sent data to the client (would cause duplicate/interleaved streams)
-        if (streamDataSent) {
-          logInfo('[Stream] Data already sent, skipping retry to avoid duplicate streams', {
-            context: 'Stream Retry',
-            streamDataSent: true
-          });
-        } else if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+        // For rate limits, we can retry even if some data was sent, but we need to be careful
+        // If it's a rate limit and we haven't sent much data, retry with a new key
+        // If it's a network error, retry regardless
+        const canRetryStream = (!streamDataSent || isRateLimit) && (isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1;
+        
+        if (canRetryStream) {
           // Retry on rate limit or network errors for streaming too
           retryCount++;
           
-          // Add delay for rate limits
+          // Add delay for rate limits (exponential backoff)
           if (isRateLimit) {
-            const msg = `[Retry] Rate limit hit on stream, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
-            await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+            const msg = `[Retry] Rate limit hit on stream, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: retryDelayMs });
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
           } else if (shouldRetryForNetwork) {
-            const msg = `[Retry] Network error on stream: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
-            await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+            const msg = `[Retry] Network error on stream: ${error.code || error.message}, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: retryDelayMs, errorCode: error.code });
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
           }
+          
+          // Reset streamDataSent since we're retrying with a fresh connection
+          streamDataSent = false;
           
           // Continue to next iteration of while loop (retry)
           continue;
@@ -1121,11 +1129,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Add delay for rate limits
+        // Add delay for rate limits (exponential backoff)
         if (isRateLimit) {
-          const msg = `[Retry] Rate limit hit, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-          logInfo(msg, { context: 'Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
-          await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+          const msg = `[Retry] Rate limit hit, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+          logInfo(msg, { context: 'Retry', retryCount, delayMs: retryDelayMs });
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
         } else if (shouldRetryForNetwork) {
           const msg = `[Retry] Network error: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
           logInfo(msg, { context: 'Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
@@ -1202,10 +1210,65 @@ app.get('/v1/models', async (req, res) => {
       
       return res.json(responseData);
     } catch (error) {
-      const isRateLimit = await keyManager.markKeyError(error);
+      const keyRateLimit = await keyManager.markKeyError(error);
+      
+      const errorData = error.response?.data;
+      const safeStringify = (obj) => {
+        try { return JSON.stringify(obj); } catch { return String(obj); }
+      };
+      const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
+      
+      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
+      const isRateLimitFromResponse = KeyManager.isRateLimitError({
+        response: { data: errorData, status: error.response?.status, headers: error.response?.headers }
+      });
+      
+      const isRateLimitFromError = error.isRateLimit === true;
+      
+      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
+      // Combine with other detection methods for robustness
+      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
+      
+      // Calculate retry delay with exponential backoff
+      const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
+      
+      // Check for network errors that should trigger a retry
+      const isNetworkError = error.code && (
+        error.code === 'ECONNRESET' ||
+        error.code === 'ETIMEDOUT' ||
+        error.code === 'ECONNABORTED' ||
+        error.code === 'ENOTFOUND' ||
+        error.code === 'ENETUNREACH' ||
+        error.code === 'EAI_AGAIN' ||
+        error.code === 'EHOSTUNREACH' ||
+        error.code === 'EPIPE' ||
+        error.code === 'ECONNREFUSED'
+      );
+      
+      // Check for idle timeout in error message
+      const isIdleTimeout = errorMessage && (
+        errorMessage.toLowerCase().includes('idle timeout') ||
+        errorMessage.toLowerCase().includes('upstream idle timeout') ||
+        errorMessage.toLowerCase().includes('connection timeout') ||
+        errorMessage.toLowerCase().includes('connection closed') ||
+        errorMessage.toLowerCase().includes('socket hang up')
+      );
+      
+      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
-      if ((isRateLimit || error.response?.status >= 500) && retryCount < maxRetries - 1) {
+      if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
+        
+        // Add delay for rate limits (exponential backoff)
+        if (isRateLimit) {
+          const msg = `[Retry] Rate limit hit on models, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: retryDelayMs });
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        } else if (shouldRetryForNetwork) {
+          const msg = `[Retry] Network error on models: ${error.code || error.message}, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: retryDelayMs, errorCode: error.code });
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
         continue;
       }
 
@@ -1406,7 +1469,13 @@ app.post('/v1/messages', async (req, res) => {
       });
       
       const isRateLimitFromError = error.isRateLimit === true;
-      const isRateLimit = isRateLimitFromResponse || isRateLimitFromError;
+      
+      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
+      // Combine with other detection methods for robustness
+      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
+      
+      // Calculate retry delay with exponential backoff
+      const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
       
       // Check for network errors that should trigger a retry
       const isNetworkError = error.code && (
@@ -1435,13 +1504,13 @@ app.post('/v1/messages', async (req, res) => {
       if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         if (isRateLimit) {
-          const msg = `[Retry] Rate limit hit on Anthropic, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS });
-          await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+          const msg = `[Retry] Rate limit hit on Anthropic, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: retryDelayMs });
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
         } else if (shouldRetryForNetwork) {
-          const msg = `[Retry] Network error on Anthropic: ${error.code || error.message}, waiting ${CONFIG.RETRY_DELAY_MS}ms before retry...`;
-          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: CONFIG.RETRY_DELAY_MS, errorCode: error.code });
-          await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY_MS));
+          const msg = `[Retry] Network error on Anthropic: ${error.code || error.message}, waiting ${retryDelayMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
+          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: retryDelayMs, errorCode: error.code });
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
         }
         continue;
       }

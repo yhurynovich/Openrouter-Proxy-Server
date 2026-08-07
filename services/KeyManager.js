@@ -2,14 +2,18 @@ import ApiKey from '../models/ApiKey.js';
 import { logKeyEvent, logError } from './logger.js';
 
 const KEY_MANAGER_CONFIG = {
-  MAX_ROTATION_DEPTH: parseInt(process.env.KEY_MAX_ROTATION_DEPTH || '2', 10),
+  MAX_ROTATION_DEPTH: parseInt(process.env.KEY_MAX_ROTATION_DEPTH || '3', 10),
   MAX_FAILURE_COUNT: parseInt(process.env.KEY_MAX_FAILURE_COUNT || '5', 10),
   REACTIVATION_FAILURE_REDUCTION: parseInt(process.env.KEY_REACTIVATION_FAILURE_REDUCTION || '2', 10),
   // Rate limit header parsing thresholds
   UNIX_TIMESTAMP_THRESHOLD: 1e9,        // Unix timestamp in seconds (before year 2001)
   MILLISECOND_THRESHOLD: 1e12,          // Milliseconds since epoch (year ~2001+)
   PADDED_SECOND_THRESHOLD: 1e13,        // Seconds with 3 padded zeros (year ~2286+)
-  DEFAULT_RATE_LIMIT_WINDOW_MS: 60000   // Default 1 minute fallback
+  DEFAULT_RATE_LIMIT_WINDOW_MS: 60000,  // Default 1 minute fallback
+  // Retry configuration
+  BASE_RETRY_DELAY_MS: parseInt(process.env.KEY_BASE_RETRY_DELAY_MS || '1000', 10),
+  MAX_RETRY_DELAY_MS: parseInt(process.env.KEY_MAX_RETRY_DELAY_MS || '30000', 10),
+  RETRY_JITTER_FACTOR: 0.3
 };
 
 /**
@@ -195,6 +199,11 @@ class KeyManager {
    * Handles NVIDIA, Xiaomi MiMo, and generic rate limit patterns
    */
   static isRateLimitError(error) {
+    // Check HTTP status code first - 429 is definitive
+    if (error.response?.status === 429) {
+      return true;
+    }
+    
     if (!error.response?.data) return false;
     
     const data = error.response.data;
@@ -229,7 +238,10 @@ class KeyManager {
           lowerMessage.includes('rate limited') ||
           lowerMessage.includes('throttl') ||
           lowerMessage.includes('idle timeout') ||
-          lowerMessage.includes('upstream idle timeout')) {
+          lowerMessage.includes('upstream idle timeout') ||
+          lowerMessage.includes('capacity') ||
+          lowerMessage.includes('busy') ||
+          lowerMessage.includes('overload')) {
         return true;
       }
     }
@@ -263,17 +275,42 @@ class KeyManager {
   /**
    * Parse rate limit reset header from OpenRouter response
    * Handles multiple formats: seconds with padded zeros, milliseconds, seconds, or relative seconds
+   * Also handles Xiaomi MiMo specific headers
    * @param {Object} headers - Response headers
    * @returns {Date} Reset date
    */
   parseRateLimitReset(headers) {
-    const resetTime = headers?.['ratelimit-reset'] || headers?.['x-ratelimit-reset'] || headers?.['retry-after'];
+    // Check multiple possible header names (case-insensitive)
+    const headerNames = [
+      'ratelimit-reset',
+      'x-ratelimit-reset',
+      'retry-after',
+      'x-rate-limit-reset',
+      'x-ratelimit-reset-after',
+      'rate-limit-reset'
+    ];
+    
+    let resetTime = null;
+    for (const name of headerNames) {
+      // Headers in axios are lowercased
+      const lowerName = name.toLowerCase();
+      if (headers[lowerName]) {
+        resetTime = headers[lowerName];
+        break;
+      }
+    }
+    
     if (!resetTime) {
       return new Date(Date.now() + KEY_MANAGER_CONFIG.DEFAULT_RATE_LIMIT_WINDOW_MS);
     }
     
     const resetNum = parseInt(resetTime, 10);
     if (isNaN(resetNum)) {
+      // Handle HTTP-date format (e.g., "Wed, 21 Oct 2015 07:28:00 GMT")
+      const parsedDate = new Date(resetTime);
+      if (!isNaN(parsedDate.getTime())) {
+        return parsedDate;
+      }
       return new Date(Date.now() + KEY_MANAGER_CONFIG.DEFAULT_RATE_LIMIT_WINDOW_MS);
     }
     
@@ -296,6 +333,26 @@ class KeyManager {
     }
     // Relative seconds from now (or retry-after header in seconds)
     return new Date(Date.now() + resetNum * 1000);
+  }
+
+  /**
+   * Calculate exponential backoff delay with jitter
+   * @param {number} retryCount - Current retry attempt (0-indexed)
+   * @returns {number} Delay in milliseconds
+   */
+  calculateRetryDelay(retryCount) {
+    const baseDelay = KEY_MANAGER_CONFIG.BASE_RETRY_DELAY_MS;
+    const maxDelay = KEY_MANAGER_CONFIG.MAX_RETRY_DELAY_MS;
+    const jitterFactor = KEY_MANAGER_CONFIG.RETRY_JITTER_FACTOR;
+    
+    // Exponential backoff: baseDelay * 2^retryCount
+    const exponentialDelay = baseDelay * Math.pow(2, retryCount);
+    const cappedDelay = Math.min(exponentialDelay, maxDelay);
+    
+    // Add jitter: ±jitterFactor * cappedDelay
+    const jitter = cappedDelay * jitterFactor * (Math.random() * 2 - 1);
+    
+    return Math.floor(Math.max(baseDelay, cappedDelay + jitter));
   }
 
   async markKeyError(error) {
