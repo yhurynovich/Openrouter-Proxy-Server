@@ -383,4 +383,5 @@ class KeyManager {
   }
 }
 
+export { KeyManager };
 export default new KeyManager();
