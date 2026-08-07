@@ -1,1 +1,1 @@
-{"logLevel":"warning","console":{"enabled":true,"colorize":true},"file":{"enabled":true,"directory":"logs","maxSize":"20m","maxFiles":"14d"},"categories":{"request":"warning","error":"error","key":"info","stream":"info"}}
+{"logLevel":"warning","console":{"enabled":true,"colorize":true},"file":{"enabled":true,"directory":"logs","maxSize":"20m","maxFiles":"14d"},"categories":{"request":"warning","error":"error","key":"info","stream":"debug"}}

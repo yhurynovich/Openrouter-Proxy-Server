@@ -42,39 +42,79 @@ const openai = new OpenAI({
 
 ## ✨ Features
 
-| **Key Management** 🔑         | **Streaming** 🌊           | **Observability** 📊         |
-|-------------------------------|---------------------------|-----------------------------|
-| Smart API key rotation         | Full streaming support    | Comprehensive logging       |
-| Sticky session optimization    | Automatic retry logic     | Daily log rotation          |
-| JSON-based storage             | Connection management     | Error tracking              |
-| Rate limit handling            | Chunk processing          | Key status monitoring       |
-
-## 📦 Getting Started
-
-### Prerequisites
-- Node.js 16+
-- OpenRouter API key(s)
-
-```bash
-git clone https://github.com/yourrepo/Openrouter-Proxy-Server.git
-cd Openrouter-Proxy-Server
-npm install
-```
+| **Key Management** 🔑         | **Streaming** 🌊           | **Observability** 📊         | **Security** 🔒           |
+|-------------------------------|---------------------------|-----------------------------|--------------------------|
+| Smart API key rotation         | Full streaming support    | Comprehensive logging       | Timing-safe auth         |
+| Sticky session optimization    | Automatic retry logic     | Daily log rotation          | Admin rate limiting      |
+| JSON-based storage             | Connection management     | Error tracking              | Header injection protection |
+| Rate limit handling            | Chunk processing          | Key status monitoring       | Abort on client disconnect |
 
 ## 🛠 Configuration
 
-1. **Add API keys** using the interactive script:
+### Environment Variables (`.env`)
+
+```env
+# Server
+PORT=3000                           # Server port (default: 3000)
+
+# OpenRouter API Keys (comma-separated for multiple keys)
+OPENROUTER_API_KEYS=sk-or-xxx,sk-or-yyy
+
+# OpenRouter Settings
+HTTP_REFERER=http://localhost:3000  # Referer header for OpenRouter
+SITE_NAME=OpenRouterProxy           # Site title for OpenRouter
+
+# Rate Limiting (general)
+RATE_LIMIT_WINDOW_MS=60000          # Rate limit window in ms (default: 1 min)
+RATE_LIMIT_MAX=100                  # Max requests per window (default: 100)
+
+# Admin Rate Limiting (stricter)
+ADMIN_RATE_LIMIT_WINDOW_MS=60000    # Admin rate limit window in ms (default: 1 min)
+ADMIN_RATE_LIMIT_MAX=10             # Max admin requests per window (default: 10)
+
+# Request Limits
+BODY_LIMIT=5mb                      # Max request body size (default: 5mb)
+MAX_MESSAGE_LENGTH=100000           # Max characters per message (default: 100k)
+SSE_BUFFER_LIMIT=10485760           # SSE buffer limit in bytes (default: 10MB)
+
+# Retry Settings
+MAX_RETRIES=3                       # Max retry attempts (default: 3)
+RETRY_DELAY_MS=1000                 # Delay between retries in ms (default: 1000)
+
+# Timeouts
+AXIOS_TIMEOUT=120000                # Upstream request timeout in ms (default: 120s)
+MODELS_TIMEOUT=30000                # Models endpoint timeout in ms (default: 30s)
+AXIOS_MAX_SOCKETS=50                # Max concurrent sockets (default: 50)
+AXIOS_MAX_FREE_SOCKETS=10           # Max free sockets (default: 10)
+AXIOS_KEEPALIVE_TIMEOUT=60000       # Keep-alive timeout in ms (default: 60s)
+AXIOS_FREE_SOCKET_TIMEOUT=30000     # Free socket timeout in ms (default: 30s)
+
+# Key Manager
+KEY_MAX_ROTATION_DEPTH=2            # Max key rotation recursion depth (default: 2)
+KEY_MAX_FAILURE_COUNT=5             # Max failures before key deactivation (default: 5)
+KEY_REACTIVATION_FAILURE_REDUCTION=2 # Failure reduction on bulk reactivation (default: 2)
+
+# Logging
+LOG_LEVEL=warning                   # Global log level (error|warning|info|debug)
+LOG_RETENTION_DAYS=14               # Log retention in days (default: 14)
+```
+
+### Adding API Keys
+
 ```bash
 node add-key.js
 ```
 
-2. **Configure environment** (`.env`):
-```env
-PORT=3000  # Default port
-LOG_RETENTION_DAYS=14  # Keep logs for 14 days
+Or programmatically via admin API:
+```bash
+curl -X POST http://localhost:3000/admin/keys \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Secret: your-admin-secret" \
+  -d '{"key": "sk-or-your-api-key"}'
 ```
 
-3. **Start the server**:
+### Starting the Server
+
 ```bash
 node server.js
 ```
@@ -150,6 +190,36 @@ The key rotation system implements:
 - **Age-based Selection**: Rotates to least recently used available key
 - **Automatic Recovery**: Keys automatically reactivate after cooldown period
 - **Key Reactivation**: Deactivated keys can be re-added through admin API
+- **Thread-Safe Mutex**: Uses promise-based mutex to prevent race conditions during rotation
+- **Graceful Reactivation**: Bulk key reactivation with graduated failure reduction
+
+## 🔒 Security Features
+
+- **Timing-Safe Comparison**: Admin secret uses `crypto.timingSafeEqual()` with length validation
+- **Header Injection Protection**: All header values sanitized (newlines stripped, length limited)
+- **Admin Rate Limiting**: Dedicated stricter rate limiter (10 req/min) for admin endpoints
+- **Input Validation**: Message length limits, request body size limits, SSE buffer limits
+- **Request Sanitization**: Automatic redaction of sensitive fields in logs
+- **Abort on Disconnect**: Upstream requests cancelled when client disconnects
+- **Security Headers**: X-Content-Type-Options, X-Frame-Options, X-XSS-Protection, Referrer-Policy
+
+## 📊 Observability
+
+### Logging
+- `logs/requests-%DATE%.log`: Request/response details (sanitized)
+- `logs/errors-%DATE%.log`: Error stack traces with context
+- `logs/keys-%DATE%.log`: Key rotation events
+- `logs/streams-%DATE%.log`: Stream chunk logs (debug level)
+
+### Log Levels
+- **error**: Errors and critical issues
+- **warning**: Important events (default)
+- **info**: Key events, successes
+- **debug**: Stream chunks, detailed tracing
+
+### Health Checks
+- `GET /health` - Returns `ready`/`not ready` status
+- `GET /v1/models` - Models endpoint with retry logic
 
 ## 📚 Documentation
 
@@ -163,6 +233,7 @@ The key rotation system implements:
 - Headers:
   - `Content-Type: application/json`
   - `Authorization: Bearer dummy-key` (actual key managed by proxy)
+  - `X-Request-ID`: Added for distributed tracing
 
 #### Models List
 `GET /v1/models`
@@ -175,42 +246,8 @@ The key rotation system implements:
 `POST /admin/keys`
 - Adds new API keys to the rotation pool
 - Body: `{ "key": "your-openrouter-api-key" }`
-- Protected endpoint (consider adding authentication)
-
-### Troubleshooting
-
-#### Common Issues
-
-1. **Rate Limits**
-   - Symptom: 429 status code
-   - Solution: System automatically rotates keys and retries
-   - Prevention: Add more API keys or increase request intervals
-
-2. **Streaming Disconnections**
-   - Symptom: Stream ends unexpectedly
-   - Solution: 
-     - Check network stability
-     - Use non-streaming mode for unreliable connections
-     - Implement client-side retry logic
-
-3. **No Available Keys**
-   - Symptom: "No available API keys" error
-   - Solution:
-     - Add new keys via admin API
-     - Wait for cooldown period to end
-     - Check key status in logs
-
-4. **High Latency**
-   - Symptom: Slow response times
-   - Solution:
-     - Add more API keys to rotation pool
-     - Monitor network conditions
-     - Consider server location relative to API
-
-#### Logs Location
-- `logs/requests-%DATE%.log`: Request/response details
-- `logs/errors-%DATE%.log`: Error stack traces
-- `logs/keys-%DATE%.log`: Key rotation events
+- Requires `X-Admin-Secret` header
+- Protected by dedicated admin rate limiter (10 req/min)
 
 ### Architecture
 
@@ -229,25 +266,43 @@ graph TD
 
 #### Key Components
 
-1. **Express Server**
+1. **Express Server** (`server.js`)
    - Handles HTTP routing
    - Manages request/response lifecycle
    - Implements error middleware
+   - Centralized configuration via `CONFIG` object
 
-2. **Key Manager**
+2. **Key Manager** (`services/KeyManager.js`)
    - Maintains key rotation logic
    - Tracks key health and status
    - Implements cooldown periods
+   - Thread-safe mutex for rotation
+   - Centralized NVIDIA rate limit detection
 
-3. **Logging System**
+3. **Logging System** (`services/logger.js`)
    - Request logging middleware
    - Error tracking
    - Key event monitoring
+   - Stream chunk logging (debug level)
+   - Explicit Winston transports per category
 
-4. **Stream Handler**
+4. **Stream Handler** (`server.js` - `handleStreamingResponse`)
    - Manages SSE connections
-   - Processes stream chunks
-   - Handles disconnections
+   - Processes stream chunks incrementally
+   - Buffer overflow protection (10MB buffer, 1MB per event)
+   - Client disconnect handling with AbortController
+   - Optimized SSE parser using `indexOf` instead of `split`
+
+5. **Key Storage** (`models/ApiKey.js`)
+   - JSON-based file storage
+   - Atomic writes with temp file + rename
+   - File-lock mutex with 30s timeout
+   - Empty query returns all keys (fixed bug)
+
+6. **Sanitization** (`services/utils/sanitize.js`)
+   - Recursive redaction of sensitive fields
+   - Structured clone with fallback
+   - Specific sensitive key patterns (not generic 'key')
 
 #### Design Principles
 - Separation of concerns
@@ -255,6 +310,84 @@ graph TD
 - Comprehensive logging
 - Efficient key utilization
 - Graceful error handling
+- Thread-safe operations
+- Resource cleanup on disconnect
+
+## 🐛 Troubleshooting
+
+### Common Issues
+
+#### 1. **Rate Limits**
+- Symptom: 429 status code
+- Solution: System automatically rotates keys and retries
+- Prevention: Add more API keys or increase request intervals
+
+#### 2. **Streaming Disconnections**
+- Symptom: Stream ends unexpectedly
+- Solution: 
+  - Check network stability
+  - Use non-streaming mode for unreliable connections
+  - Implement client-side retry logic
+
+#### 3. **No Available Keys**
+- Symptom: "No available API keys" error
+- Solution:
+  - Add new keys via admin API
+  - Wait for cooldown period to end
+  - Check key status in logs
+
+#### 4. **High Latency**
+- Symptom: Slow response times
+- Solution:
+  - Add more API keys to rotation pool
+  - Monitor network conditions
+  - Consider server location relative to API
+
+#### 5. **Buffer Overflow**
+- Symptom: "SSE buffer exceeded maximum size" error
+- Solution:
+  - Increase `SSE_BUFFER_LIMIT` environment variable
+  - Check for unusually large responses from upstream
+  - Consider non-streaming mode for large responses
+
+### Logs Location
+- `logs/requests-%DATE%.log`: Request/response details
+- `logs/errors-%DATE%.log`: Error stack traces
+- `logs/keys-%DATE%.log`: Key rotation events
+- `logs/streams-%DATE%.log`: Stream chunk logs
+
+## 🧪 Testing & Quality
+
+The codebase has been through multiple rounds of automated code review using the Council Code Review skill, which identified and fixed:
+
+### Critical Bugs Fixed
+- Race condition in key rotation mutex
+- Unbounded SSE buffer growth
+- Timing attack on admin secret
+- Double key initialization race
+- Streaming double-end on rate limits
+- File storage concurrency issues
+- Missing client disconnect handling
+
+### Security Issues Fixed
+- Plaintext key storage (documented for future encryption)
+- Admin endpoint rate limiting
+- Header injection prevention
+- CSP header removal for API-only service
+- Logging sanitization improvements
+
+### Performance Improvements
+- Optimized SSE parser (incremental `indexOf` instead of `split`)
+- Streaming logs at debug level
+- AbortController for upstream cancellation
+- Named constants replacing magic numbers
+- Explicit Winston transports
+
+### Edge Cases Handled
+- Client disconnect aborts upstream
+- Buffer overflow clean error handling
+- Stream data sent flag prevents duplicate retries
+- Proper exit codes on failure
 
 ## 📜 License
 MIT © Adrian Belmans - See [LICENSE](LICENSE) for details

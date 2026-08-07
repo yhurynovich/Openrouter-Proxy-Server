@@ -1,16 +1,21 @@
 export const sanitizeRequest = (request) => {
   // Use structuredClone for deep clone (handles circular refs, BigInt, etc)
   // Fallback to JSON for older environments
-  const sanitized = (typeof structuredClone === 'function')
-    ? structuredClone(request)
-    : (() => {
-        try {
-          return JSON.parse(JSON.stringify(request));
-        } catch {
-          // If circular ref or other issue, return a safe minimal object
-          return { ...request };
-        }
-      })();
+  let sanitized;
+  try {
+    if (typeof structuredClone === 'function') {
+      sanitized = structuredClone(request);
+    } else {
+      sanitized = JSON.parse(JSON.stringify(request));
+    }
+  } catch {
+    // If both fail (circular refs, etc.), return minimal safe object
+    sanitized = { 
+      _sanitizationFailed: true,
+      method: request?.method,
+      url: request?.url 
+    };
+  }
   
   // Recursively redact sensitive fields
   const redact = (obj, path = '') => {
@@ -25,8 +30,8 @@ export const sanitizeRequest = (request) => {
       const fullPath = path ? `${path}.${k}` : k;
       const lowerKey = k.toLowerCase();
       
-      // Redact known sensitive keys
-      if (['authorization', 'x-api-key', 'apikey', 'api_key', 'key', 'apikey'].includes(lowerKey)) {
+      // Redact known sensitive keys (specific patterns only, not generic 'key')
+      if (['authorization', 'x-api-key', 'apikey', 'api_key', 'secret', 'password', 'token', 'access_token', 'refresh_token'].includes(lowerKey)) {
         result[k] = 'REDACTED';
       } else if (typeof v === 'object' && v !== null) {
         // Recurse into nested objects

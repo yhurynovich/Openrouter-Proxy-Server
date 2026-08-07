@@ -5,6 +5,35 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KEYS_FILE = join(__dirname, '../data/keys.json');
 
+// File lock mutex with timeout to prevent hang on process crash
+let writeLock = Promise.resolve();
+const WRITE_LOCK_TIMEOUT = 30000; // 30 seconds
+
+async function withWriteLock(fn) {
+  const prev = writeLock;
+  let release;
+  let timeoutId;
+  
+  // Create a new promise with timeout
+  const lockPromise = new Promise((resolve, reject) => {
+    release = resolve;
+    timeoutId = setTimeout(() => {
+      reject(new Error('Write lock timeout - possible deadlock'));
+    }, WRITE_LOCK_TIMEOUT);
+  });
+  
+  writeLock = lockPromise;
+  
+  try {
+    await prev;
+    clearTimeout(timeoutId);
+    return await fn();
+  } finally {
+    clearTimeout(timeoutId);
+    release();
+  }
+}
+
 class ApiKey {
   constructor(data) {
     this.key = data.key;
@@ -16,6 +45,10 @@ class ApiKey {
   }
 
   static #filterKey(key, query) {
+    // If query is empty or only contains non-filtering keys, match all
+    const hasFilters = query.isActive !== undefined || query.$or || query.key;
+    if (!hasFilters) return true;
+    
     if (query.isActive && !key.isActive) return false;
     if (query.$or) {
       return query.$or.some(condition => {
@@ -25,7 +58,7 @@ class ApiKey {
         if (condition.rateLimitResetAt?.$lte) {
           // $lte should only match actual dates, not null/undefined
           if (!key.rateLimitResetAt) return false;
-          return new Date(key.rateLimitResetAt) <= new Date();
+          return new Date(key.rateLimitResetAt) <= new Date(condition.rateLimitResetAt.$lte);
         }
         return false;
       });
@@ -45,23 +78,27 @@ class ApiKey {
   }
 
   static async create(data) {
-    const keys = await this.#readKeys();
-    const newKey = new ApiKey(data);
-    keys.push(newKey);
-    await this.#writeKeys(keys);
-    return newKey;
+    return withWriteLock(async () => {
+      const keys = await this.#readKeys();
+      const newKey = new ApiKey(data);
+      keys.push(newKey);
+      await this.#writeKeys(keys);
+      return newKey;
+    });
   }
 
   async save() {
-    const keys = await ApiKey.#readKeys();
-    const index = keys.findIndex(k => k._id === this._id);
-    if (index !== -1) {
-      keys[index] = this;
-    } else {
-      keys.push(this);
-    }
-    await ApiKey.#writeKeys(keys);
-    return this;
+    return withWriteLock(async () => {
+      const keys = await ApiKey.#readKeys();
+      const index = keys.findIndex(k => k._id === this._id);
+      if (index !== -1) {
+        keys[index] = this;
+      } else {
+        keys.push(this);
+      }
+      await ApiKey.#writeKeys(keys);
+      return this;
+    });
   }
 
   static async #readKeys() {

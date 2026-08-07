@@ -14,7 +14,7 @@ let loggerConfig = {
   logLevel: 'warning',
   console: { enabled: true, colorize: true },
   file: { enabled: true, directory: 'logs', maxSize: '20m', maxFiles: '14d' },
-  categories: { request: 'warning', error: 'error', key: 'info', stream: 'info' }
+  categories: { request: 'warning', error: 'error', key: 'info', stream: 'debug' }
 };
 
 try {
@@ -32,10 +32,6 @@ await fs.mkdir(logsDir, { recursive: true });
 const levelPriority = { error: 0, warning: 1, info: 2, debug: 3 };
 const globalLevelPriority = levelPriority[loggerConfig.logLevel] ?? 1;
 
-// Logger level should be the most permissive to allow all messages to reach transports
-// Transports will do the actual filtering
-const loggerLevel = 'info'; // Allow all messages to pass to transports
-
 // Custom formatter that adds [LEVEL] prefix
 const customFormat = winston.format.printf(({ level, message, timestamp, ...metadata }) => {
   let metaStr = '';
@@ -45,74 +41,83 @@ const customFormat = winston.format.printf(({ level, message, timestamp, ...meta
   return `${timestamp} [${level.toUpperCase()}] ${message}${metaStr}`;
 });
 
-// Create transports based on config
-const transports = [];
+// Create explicit transports for each category
+const requestTransport = new winston.transports.DailyRotateFile({
+  filename: path.join(logsDir, 'requests-%DATE%.log'),
+  datePattern: 'YYYY-MM-DD',
+  maxSize: loggerConfig.file.maxSize,
+  maxFiles: loggerConfig.file.maxFiles,
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: loggerConfig.categories.request
+});
 
-if (loggerConfig.file.enabled) {
-  transports.push(
-    new winston.transports.DailyRotateFile({
-      filename: path.join(logsDir, 'requests-%DATE%.log'),
-      datePattern: 'YYYY-MM-DD',
-      maxSize: loggerConfig.file.maxSize,
-      maxFiles: loggerConfig.file.maxFiles,
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        customFormat
-      ),
-      level: loggerConfig.categories.request
-    }),
-    new winston.transports.DailyRotateFile({
-      filename: path.join(logsDir, 'errors-%DATE%.log'),
-      datePattern: 'YYYY-MM-DD',
-      maxSize: loggerConfig.file.maxSize,
-      maxFiles: loggerConfig.file.maxFiles,
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        customFormat
-      ),
-      level: loggerConfig.categories.error
-    }),
-    new winston.transports.DailyRotateFile({
-      filename: path.join(logsDir, 'keys-%DATE%.log'),
-      datePattern: 'YYYY-MM-DD',
-      maxSize: loggerConfig.file.maxSize,
-      maxFiles: loggerConfig.file.maxFiles,
-      format: winston.format.combine(
-        winston.format.timestamp(),
-        customFormat
-      ),
-      level: loggerConfig.categories.key
-    })
-  );
-}
+const errorTransport = new winston.transports.DailyRotateFile({
+  filename: path.join(logsDir, 'errors-%DATE%.log'),
+  datePattern: 'YYYY-MM-DD',
+  maxSize: loggerConfig.file.maxSize,
+  maxFiles: loggerConfig.file.maxFiles,
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: loggerConfig.categories.error
+});
 
-if (loggerConfig.console.enabled) {
-  transports.push(
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.timestamp(),
-        customFormat
-      ),
-      level: loggerConfig.logLevel
-    })
-  );
-}
+const keyTransport = new winston.transports.DailyRotateFile({
+  filename: path.join(logsDir, 'keys-%DATE%.log'),
+  datePattern: 'YYYY-MM-DD',
+  maxSize: loggerConfig.file.maxSize,
+  maxFiles: loggerConfig.file.maxFiles,
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: loggerConfig.categories.key
+});
 
-// Create loggers with permissive level to let transports filter
+const streamTransport = new winston.transports.DailyRotateFile({
+  filename: path.join(logsDir, 'streams-%DATE%.log'),
+  datePattern: 'YYYY-MM-DD',
+  maxSize: loggerConfig.file.maxSize,
+  maxFiles: loggerConfig.file.maxFiles,
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: loggerConfig.categories.stream
+});
+
+const consoleTransport = loggerConfig.console.enabled ? new winston.transports.Console({
+  format: winston.format.combine(
+    winston.format.colorize(),
+    winston.format.timestamp(),
+    customFormat
+  ),
+  level: loggerConfig.logLevel
+}) : null;
+
+// Create loggers with explicit transports
 export const requestLogger = winston.createLogger({
-  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('requests')),
-  level: loggerLevel
+  transports: [requestTransport].concat(consoleTransport ? [consoleTransport] : []),
+  level: 'info'
 });
 
 export const errorLogger = winston.createLogger({
-  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('errors')),
-  level: loggerLevel
+  transports: [errorTransport].concat(consoleTransport ? [consoleTransport] : []),
+  level: 'info'
 });
 
 export const keyLogger = winston.createLogger({
-  transports: transports.filter(t => t instanceof winston.transports.DailyRotateFile && t.filename.includes('keys')),
-  level: loggerLevel
+  transports: [keyTransport].concat(consoleTransport ? [consoleTransport] : []),
+  level: 'info'
+});
+
+export const streamLogger = winston.createLogger({
+  transports: [streamTransport].concat(consoleTransport ? [consoleTransport] : []),
+  level: 'debug'
 });
 
 // Helper function to check if should log at level (for performance optimization)
@@ -120,17 +125,12 @@ const shouldLog = (categoryLevel) => {
   return levelPriority[categoryLevel] <= globalLevelPriority;
 };
 
-// Also check if any transport would log this level (for early return optimization)
-const shouldLogAny = (categoryLevel) => {
-  return levelPriority[categoryLevel] <= globalLevelPriority;
-};
-
-// Helper function to log streaming chunks
+// Helper function to log streaming chunks (at debug level to reduce volume)
 export const logStreamChunk = (requestId, chunk) => {
-  if (!shouldLog('info')) return;
+  if (!shouldLog('debug')) return;
   try {
     const data = chunk.toString();
-    requestLogger.info('Stream Chunk', {
+    streamLogger.debug('Stream Chunk', {
       requestId,
       data: data.trim()
     });
@@ -228,8 +228,10 @@ export const logKeyEvent = (event, details) => {
 
 // Helper function to log errors
 export const logError = (error, context = {}) => {
+  // Sanitize context to prevent sensitive data leakage
+  const sanitizedContext = sanitizeRequest(context);
   errorLogger.error(error.message, {
     stack: error.stack,
-    ...context
+    ...sanitizedContext
   });
 };

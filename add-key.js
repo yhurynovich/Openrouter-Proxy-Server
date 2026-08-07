@@ -35,6 +35,7 @@ async function addApiKey(key) {
     console.log('✅ New API key added successfully');
   } catch (error) {
     console.error('❌ Error adding API key:', error.message);
+    throw error; // Re-throw to be caught by main()
   }
 }
 

@@ -1,10 +1,48 @@
 import ApiKey from '../models/ApiKey.js';
 import { logKeyEvent, logError } from './logger.js';
 
+const KEY_MANAGER_CONFIG = {
+  MAX_ROTATION_DEPTH: parseInt(process.env.KEY_MAX_ROTATION_DEPTH || '2', 10),
+  MAX_FAILURE_COUNT: parseInt(process.env.KEY_MAX_FAILURE_COUNT || '5', 10),
+  REACTIVATION_FAILURE_REDUCTION: parseInt(process.env.KEY_REACTIVATION_FAILURE_REDUCTION || '2', 10),
+  // Rate limit header parsing thresholds
+  UNIX_TIMESTAMP_THRESHOLD: 1e9,        // Unix timestamp in seconds (before year 2001)
+  MILLISECOND_THRESHOLD: 1e12,          // Milliseconds since epoch (year ~2001+)
+  PADDED_SECOND_THRESHOLD: 1e13,        // Seconds with 3 padded zeros (year ~2286+)
+  DEFAULT_RATE_LIMIT_WINDOW_MS: 60000   // Default 1 minute fallback
+};
+
+/**
+ * Validate OpenRouter API key format
+ * @param {string} key - API key to validate
+ * @returns {boolean} true if valid format
+ */
+function validateApiKeyFormat(key) {
+  if (!key || typeof key !== 'string') {
+    return false;
+  }
+  // OpenRouter keys typically start with 'sk-or-' and are at least 20 chars
+  const trimmed = key.trim();
+  if (trimmed.length < 20) {
+    return false;
+  }
+  // Check for common OpenRouter key prefix
+  if (!trimmed.startsWith('sk-or-')) {
+    // Allow other formats but warn
+    logError(new Error('API key format warning'), { 
+      action: 'validateApiKeyFormat', 
+      message: 'API key does not have expected sk-or- prefix',
+      keyPreview: trimmed.substring(0, 10) + '...'
+    });
+  }
+  return true;
+}
+
 class KeyManager {
+  #rotationPromise = null;
+
   constructor() {
     this.currentKey = null;
-    this.rotationLock = false;
   }
 
   async initialize() {
@@ -15,20 +53,27 @@ class KeyManager {
 
   async rotateKey(depth = 0) {
     // Prevent infinite recursion
-    if (depth > 2) {
+    if (depth > KEY_MANAGER_CONFIG.MAX_ROTATION_DEPTH) {
       const error = new Error('Max key rotation depth exceeded - no available keys');
       logError(error);
       throw error;
     }
 
-    // Prevent concurrent rotations (race condition)
-    if (this.rotationLock) {
-      // Wait for the other rotation to complete
-      await new Promise(resolve => setTimeout(resolve, 50));
-      return this.rotateKey(depth);
+    // Return existing rotation promise if one is in progress (mutex pattern)
+    if (this.#rotationPromise) {
+      return this.#rotationPromise;
     }
 
-    this.rotationLock = true;
+    this.#rotationPromise = this.#doRotateKey(depth);
+    
+    try {
+      return await this.#rotationPromise;
+    } finally {
+      this.#rotationPromise = null;
+    }
+  }
+
+  async #doRotateKey(depth = 0) {
     
     try {
       // Get a working key that's not in cooldown
@@ -52,8 +97,8 @@ class KeyManager {
         // No keys available - attempt to reactivate all keys first
         const reactivated = await this.reactivateAllKeys();
         if (reactivated) {
-          // Try to get a key again after reactivation
-          this.rotationLock = false;
+          // Clear rotation promise before recursive call to avoid deadlock
+          this.#rotationPromise = null;
           return await this.rotateKey(depth + 1);
         }
         
@@ -82,7 +127,6 @@ class KeyManager {
           }
         }
         
-        this.rotationLock = false;
         const error = new Error(errorMessage);
         logError(error);
         throw error;
@@ -97,10 +141,8 @@ class KeyManager {
         failureCount: key.failureCount
       });
 
-      this.rotationLock = false;
       return key.key;
     } catch (error) {
-      this.rotationLock = false;
       logError(error, { action: 'rotateKey' });
       throw error;
     }
@@ -125,7 +167,7 @@ class KeyManager {
    * Check if an error response contains NVIDIA rate limit error
    * Error format: "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (32/32)"
    */
-  isNvidiaRateLimitError(error) {
+  static isNvidiaRateLimitError(error) {
     if (!error.response?.data) return false;
     
     const data = error.response.data;
@@ -148,6 +190,44 @@ class KeyManager {
             errorMessage.includes('limit reached'));
   }
 
+  /**
+   * Parse rate limit reset header from OpenRouter response
+   * Handles multiple formats: seconds with padded zeros, milliseconds, seconds, or relative seconds
+   * @param {Object} headers - Response headers
+   * @returns {Date} Reset date
+   */
+  parseRateLimitReset(headers) {
+    const resetTime = headers?.['ratelimit-reset'] || headers?.['x-ratelimit-reset'] || headers?.['retry-after'];
+    if (!resetTime) {
+      return new Date(Date.now() + KEY_MANAGER_CONFIG.DEFAULT_RATE_LIMIT_WINDOW_MS);
+    }
+    
+    const resetNum = parseInt(resetTime, 10);
+    if (isNaN(resetNum)) {
+      return new Date(Date.now() + KEY_MANAGER_CONFIG.DEFAULT_RATE_LIMIT_WINDOW_MS);
+    }
+    
+    // OpenRouter uses seconds with 3 padded zeros (e.g., 1785369600000 = 1785369600 seconds)
+    // Values > 1e12 could be either milliseconds since epoch OR seconds with padded zeros
+    // Both give similar years, but we need to handle correctly
+    if (resetNum > KEY_MANAGER_CONFIG.MILLISECOND_THRESHOLD) {
+      // If value > 1e13, it's definitely seconds with padded zeros (year > 2286)
+      // Otherwise, treat as milliseconds since epoch (more common)
+      if (resetNum > KEY_MANAGER_CONFIG.PADDED_SECOND_THRESHOLD) {
+        // Seconds with 3 padded zeros - divide by 1000 to get seconds, then multiply by 1000 for milliseconds
+        return new Date(Math.floor(resetNum / 1000) * 1000);
+      }
+      // Milliseconds since epoch
+      return new Date(resetNum);
+    }
+    // Seconds since epoch (Unix timestamp)
+    if (resetNum > KEY_MANAGER_CONFIG.UNIX_TIMESTAMP_THRESHOLD) {
+      return new Date(resetNum * 1000);
+    }
+    // Relative seconds from now (or retry-after header in seconds)
+    return new Date(Date.now() + resetNum * 1000);
+  }
+
   async markKeyError(error) {
     if (!this.currentKey) return;
 
@@ -156,39 +236,17 @@ class KeyManager {
       const isHttpRateLimit = error.response && error.response.status === 429;
       
       // Check for NVIDIA-specific rate limit in response body
-      const isNvidiaRateLimit = this.isNvidiaRateLimitError(error);
+      const isNvidiaRateLimit = KeyManager.isNvidiaRateLimitError(error);
       
       const isRateLimit = isHttpRateLimit || isNvidiaRateLimit;
 
       if (isRateLimit) {
         // OpenRouter uses 'ratelimit-reset' header (lowercase, no x- prefix)
-        const resetTime = error.response?.headers?.['ratelimit-reset'] || error.response?.headers?.['x-ratelimit-reset'];
-        console.log('[KeyManager] Rate limit reset header:', resetTime);
-        let resetDate;
-        if (resetTime) {
-          const resetNum = parseInt(resetTime, 10);
-          // Detect format:
-          // - > 1e13: seconds with padded zeros (e.g., 1785369600000 = 1785369600 seconds)
-          // - > 1e12: milliseconds since epoch
-          // - > 1e9: seconds since epoch
-          // - else: relative seconds from now
-          if (resetNum > 1e13) {
-            // Seconds with 3 padded zeros (OpenRouter format)
-            resetDate = new Date((resetNum / 1000) * 1000);
-          } else if (resetNum > 1e12) {
-            // Milliseconds since epoch
-            resetDate = new Date(resetNum);
-          } else if (resetNum > 1e9) {
-            // Seconds since epoch
-            resetDate = new Date(resetNum * 1000);
-          } else {
-            // Relative seconds from now
-            resetDate = new Date(Date.now() + resetNum * 1000);
-          }
-        } else {
-          resetDate = new Date(Date.now() + 60000);
-        }
-        console.log('[KeyManager] Parsed reset date: UTC:', resetDate.toISOString(), 'Local:', resetDate.toString());
+        const resetDate = this.parseRateLimitReset(error.response?.headers);
+        logKeyEvent('Rate Limit Reset Parsed', {
+          resetDateUtc: resetDate.toISOString(),
+          resetDateLocal: resetDate.toString()
+        });
         this.currentKey.rateLimitResetAt = resetDate;
         
         logKeyEvent('Rate Limit Hit', {
@@ -206,7 +264,7 @@ class KeyManager {
       this.currentKey.failureCount += 1;
       
       // If too many failures, deactivate the key
-      if (this.currentKey.failureCount >= 5) {
+      if (this.currentKey.failureCount >= KEY_MANAGER_CONFIG.MAX_FAILURE_COUNT) {
         this.currentKey.isActive = false;
         logKeyEvent('Key Deactivated', {
           keyId: this.currentKey._id,
@@ -255,6 +313,13 @@ class KeyManager {
 
   async addKey(key) {
     try {
+      // Validate API key format
+      if (!validateApiKeyFormat(key)) {
+        const error = new Error('Invalid API key format');
+        logError(error, { action: 'addKey', keyPreview: key?.substring(0, 10) + '...' });
+        throw error;
+      }
+      
       const existingKey = await ApiKey.findOne({ key });
       if (existingKey) {
         existingKey.isActive = true;
@@ -296,7 +361,7 @@ class KeyManager {
           key.isActive = true;
           // Graduated reset: reduce failure count but don't clear completely
           // This preserves some history of problematic keys
-          key.failureCount = Math.max(0, key.failureCount - 2);
+          key.failureCount = Math.max(0, key.failureCount - KEY_MANAGER_CONFIG.REACTIVATION_FAILURE_REDUCTION);
           key.rateLimitResetAt = null;
           await key.save();
           reactivated++;
