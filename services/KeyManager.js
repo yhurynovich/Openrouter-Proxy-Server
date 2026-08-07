@@ -132,6 +132,9 @@ class KeyManager {
         }
         
         const error = new Error(errorMessage);
+        // Attach wait time for caller to use
+        error.minWaitMs = minWaitMs;
+        error.code = 'NO_AVAILABLE_KEYS';
         logError(error);
         throw error;
       }
