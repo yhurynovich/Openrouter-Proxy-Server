@@ -381,6 +381,160 @@ The `/v1/models` endpoint returns normalized model IDs in OpenAI format.
 - Requires `X-Admin-Secret` header
 - Protected by dedicated admin rate limiter (10 req/min)
 
+## 🔗 Session & Conversation Tracking
+
+The proxy server is **stateless** — it does not maintain conversation state or session data. However, it fully supports **client-driven session tracking** through standard headers. This allows callers to correlate requests, trace conversations, and implement their own session management.
+
+### Supported Headers
+
+| Header | Purpose | Forwarded to OpenRouter |
+|--------|---------|------------------------|
+| `X-Request-ID` | Unique request identifier (auto-generated if not provided) | ✅ Yes |
+| `X-Session-ID` | Caller-defined session/conversation ID | ✅ Yes |
+| `X-Conversation-ID` | Alternative conversation identifier | ✅ Yes |
+| `HTTP-Referer` | Referer for OpenRouter analytics | ✅ Yes |
+| `X-Title` | Application name for OpenRouter | ✅ Yes |
+
+### How to Use Session IDs
+
+#### 1. **Client-Generated Session ID (Recommended)**
+
+Generate a UUID on the client side and include it in every request for the same conversation:
+
+```javascript
+const sessionId = crypto.randomUUID(); // Generate once per conversation
+
+const openai = new OpenAI({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key',
+  defaultHeaders: {
+    'X-Session-ID': sessionId,
+    'X-Request-ID': crypto.randomUUID(), // New per request
+  }
+});
+
+// All requests in this conversation share the same sessionId
+const response1 = await openai.chat.completions.create({
+  model: 'deepseek/deepseek-chat:free',
+  messages: [{ role: 'user', content: 'Hello' }],
+});
+
+const response2 = await openai.chat.completions.create({
+  model: 'deepseek/deepseek-chat:free',
+  messages: [
+    { role: 'user', content: 'Hello' },
+    { role: 'assistant', content: response1.choices[0].message.content },
+    { role: 'user', content: 'How are you?' },
+  ],
+});
+```
+
+#### 2. **With cURL**
+
+```bash
+SESSION_ID="550e8400-e29b-41d4-a716-446655440000"
+
+curl -X POST http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy-key" \
+  -H "X-Session-ID: $SESSION_ID" \
+  -H "X-Request-ID: $(uuidgen)" \
+  -d '{
+    "model": "deepseek/deepseek-chat:free",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+#### 3. **Anthropic SDK**
+
+```javascript
+const anthropic = new Anthropic({
+  baseURL: 'http://localhost:3000/v1',
+  apiKey: 'dummy-key',
+  defaultHeaders: {
+    'X-Session-ID': sessionId,
+  }
+});
+
+const message = await anthropic.messages.create({
+  model: 'deepseek/deepseek-chat:free',
+  max_tokens: 1024,
+  messages: [{ role: 'user', content: 'Hello' }],
+});
+```
+
+### Session ID in Logs
+
+All requests are logged with their `X-Request-ID` and `X-Session-ID` (if provided):
+
+```json
+{
+  "timestamp": "2026-08-07T19:53:15.559Z",
+  "level": "info",
+  "message": "Request completed",
+  "context": "Chat completions",
+  "requestId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "sessionId": "550e8400-e29b-41d4-a716-446655440000",
+  "model": "deepseek-chat",
+  "statusCode": 200,
+  "latencyMs": 1234
+}
+```
+
+You can grep logs by session:
+```bash
+grep "550e8400-e29b-41d4-a716-446655440000" logs/requests-*.log
+```
+
+### Best Practices
+
+1. **Generate once per conversation** — Use the same `X-Session-ID` for all turns in a single conversation
+2. **New `X-Request-ID` per request** — Unique per HTTP request for distributed tracing
+3. **Use UUID v4** — Standard format: `550e8400-e29b-41d4-a716-446655440000`
+4. **Include in error reports** — Provide `X-Request-ID` when debugging issues
+5. **Correlate with upstream** — OpenRouter also logs `X-Request-ID` for end-to-end tracing
+
+### OpenRouter Conversation Continuity
+
+Note: OpenRouter **does not** maintain server-side conversation state. You must send the full message history with each request:
+
+```javascript
+const messages = [
+  { role: 'system', content: 'You are a helpful assistant.' },
+  { role: 'user', content: 'Hello' },
+  { role: 'assistant', content: 'Hi there! How can I help?' },
+  { role: 'user', content: 'What is 2+2?' },
+];
+
+await openai.chat.completions.create({
+  model: 'deepseek/deepseek-chat:free',
+  messages, // Full history every request
+});
+```
+
+The proxy's session tracking is purely for **observability and correlation** — it does not affect model behavior.
+
+### Architecture
+
+```
+┌─────────────┐     X-Session-ID + X-Request-ID     ┌─────────────────┐
+│   Client    │ ───────────────────────────────────► │   Proxy Server  │
+│             │                                      │                 │
+│ • Session   │ ◄─────────────────────────────────── │ • Logs both IDs │
+│   Manager   │           Response                   │ • Forwards to   │
+└─────────────┘                                      │   OpenRouter    │
+                                                     └────────┬────────┘
+                                                              │
+                                                              ▼
+                                                     ┌─────────────────┐
+                                                     │   OpenRouter    │
+                                                     │ • Logs X-Request-ID
+                                                     │ • No session state
+                                                     └─────────────────┘
+```
+
+The proxy is a **pass-through** for session headers — it logs them, forwards them, and uses `X-Request-ID` for internal correlation, but does not store or manage sessions.
+
 ### Architecture
 
 #### Component Overview
