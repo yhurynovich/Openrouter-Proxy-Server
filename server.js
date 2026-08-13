@@ -27,7 +27,8 @@ const CONFIG = {
   MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || '100000', 10),
   RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
   RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
-  AXIOS_TIMEOUT: parseInt(process.env.AXIOS_TIMEOUT || '120000', 10),
+  // Reduced from 120s to 60s to stay under Cloudflare's 100s timeout (error 524)
+  AXIOS_TIMEOUT: parseInt(process.env.AXIOS_TIMEOUT || '60000', 10),
   AXIOS_MAX_SOCKETS: parseInt(process.env.AXIOS_MAX_SOCKETS || '50', 10),
   AXIOS_MAX_FREE_SOCKETS: parseInt(process.env.AXIOS_MAX_FREE_SOCKETS || '10', 10),
   AXIOS_KEEPALIVE_TIMEOUT: parseInt(process.env.AXIOS_KEEPALIVE_TIMEOUT || '60000', 10),
@@ -35,9 +36,11 @@ const CONFIG = {
   // New: Idle timeout for upstream connections (default 30s)
   AXIOS_IDLE_TIMEOUT: parseInt(process.env.AXIOS_IDLE_TIMEOUT || '30000', 10),
   MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '5', 10),
-  // Max retries specifically for rate limit errors (allows longer waits)
-  MAX_RATE_LIMIT_RETRIES: parseInt(process.env.MAX_RATE_LIMIT_RETRIES || '10', 10),
+  // Reduced from 10 to 5 to limit total retry time
+  MAX_RATE_LIMIT_RETRIES: parseInt(process.env.MAX_RATE_LIMIT_RETRIES || '5', 10),
   RETRY_DELAY_MS: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
+  // Total request timeout including all retries (90s < Cloudflare's 100s)
+  TOTAL_REQUEST_TIMEOUT_MS: parseInt(process.env.TOTAL_REQUEST_TIMEOUT_MS || '90000', 10),
   SSE_BUFFER_LIMIT: parseInt(process.env.SSE_BUFFER_LIMIT || String(10 * 1024 * 1024), 10),
   MODELS_TIMEOUT: parseInt(process.env.MODELS_TIMEOUT || '30000', 10),
   HTTP_REFERER: process.env.HTTP_REFERER || 'http://localhost:3000',
@@ -954,8 +957,23 @@ app.post('/v1/chat/completions', async (req, res) => {
   let retryCount = 0;
   const isStreaming = req.body?.stream === true;
   let streamDataSent = false;
+  const requestStartTime = Date.now();
 
   while (retryCount < maxRetries) {
+    // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
+    const elapsedMs = Date.now() - requestStartTime;
+    if (elapsedMs >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+      logError(new Error('Total request timeout exceeded'), {
+        context: 'Chat completions',
+        elapsedMs,
+        timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+        retryCount
+      });
+      return res.status(504).json(normalizeErrorResponse(
+        'Request timeout: total processing time exceeded limit',
+        504
+      ));
+    }
     try {
       // Get the current key or rotate if needed
       const currentKey = await keyManager.getKey();
@@ -1215,8 +1233,23 @@ app.get('/v1/models', async (req, res) => {
   // Use higher retry limit for rate limit errors
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
   let retryCount = 0;
+  const requestStartTime = Date.now();
 
   while (retryCount < maxRetries) {
+    // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
+    const elapsedMs = Date.now() - requestStartTime;
+    if (elapsedMs >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+      logError(new Error('Total request timeout exceeded'), {
+        context: 'Models endpoint',
+        elapsedMs,
+        timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+        retryCount
+      });
+      return res.status(504).json(normalizeErrorResponse(
+        'Request timeout: total processing time exceeded limit',
+        504
+      ));
+    }
     try {
       const currentKey = await keyManager.getKey();
       
@@ -1351,6 +1384,7 @@ app.post('/v1/messages', async (req, res) => {
   // Use higher retry limit for rate limit errors
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
   let retryCount = 0;
+  const requestStartTime = Date.now();
   
   // Transform Anthropic format to OpenAI format
   const openAIBody = {
@@ -1378,6 +1412,21 @@ app.post('/v1/messages', async (req, res) => {
   }
   
   while (retryCount < maxRetries) {
+    // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
+    const elapsedMs = Date.now() - requestStartTime;
+    if (elapsedMs >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+      logError(new Error('Total request timeout exceeded'), {
+        context: 'Anthropic endpoint',
+        elapsedMs,
+        timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+        retryCount
+      });
+      return res.status(504).json(normalizeErrorResponse(
+        'Request timeout: total processing time exceeded limit',
+        504
+      ));
+    }
+
     try {
       const currentKey = await keyManager.getKey();
       
