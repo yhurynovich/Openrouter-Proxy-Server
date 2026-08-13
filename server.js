@@ -74,6 +74,12 @@ const FALLBACK_MODEL_MAPPING = {
   'liquid/lfm-40b:free': 'lfm-40b',
 };
 
+// Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
+const REVERSE_MODEL_MAPPING = new Map();
+for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
+  REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
+}
+
 /**
  * Build model ID mapping from OpenRouter model list
  * @param {Array} models - OpenRouter models array
@@ -111,6 +117,11 @@ function buildModelIdMapping(models) {
     
     if (normalizedId) {
       mapping.set(openRouterId, normalizedId);
+      // Also build reverse mapping (normalized -> OpenRouter)
+      // Only set if not already set (fallback takes priority)
+      if (!REVERSE_MODEL_MAPPING.has(normalizedId)) {
+        REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
+      }
     }
   }
   
@@ -973,6 +984,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         axiosConfig.responseType = 'stream';
       }
 
+      // Convert normalized model ID back to OpenRouter ID if needed
+      const requestBody = { ...req.body };
+      if (requestBody.model && REVERSE_MODEL_MAPPING.has(requestBody.model)) {
+        requestBody.model = REVERSE_MODEL_MAPPING.get(requestBody.model);
+      }
+
       const response = await axiosInstance.post(
         'https://openrouter.ai/api/v1/chat/completions',
         req.body,
@@ -1386,6 +1403,11 @@ app.post('/v1/messages', async (req, res) => {
       // Add responseType: 'stream' for streaming requests
       if (openAIBody.stream) {
         axiosConfig.responseType = 'stream';
+      }
+
+      // Convert normalized model ID back to OpenRouter ID if needed
+      if (openAIBody.model && REVERSE_MODEL_MAPPING.has(openAIBody.model)) {
+        openAIBody.model = REVERSE_MODEL_MAPPING.get(openAIBody.model);
       }
       
       const response = await axiosInstance.post(
