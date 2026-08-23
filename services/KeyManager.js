@@ -173,6 +173,7 @@ class KeyManager {
   /**
    * Check if an error response contains NVIDIA rate limit error
    * Error format: "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (32/32)"
+   * Also handles "Upstream error from Nvidia: Service temporarily overloaded"
    */
   static isNvidiaRateLimitError(error) {
     if (!error.response?.data) return false;
@@ -194,7 +195,9 @@ class KeyManager {
            errorMessage.includes('Upstream error from Nvidia') && 
            (errorMessage.includes('ResourceExhausted') || 
             errorMessage.includes('rate limit') ||
-            errorMessage.includes('limit reached'));
+            errorMessage.includes('limit reached') ||
+            errorMessage.includes('Service temporarily overloaded') ||
+            errorMessage.includes('overloaded'));
   }
 
   /**
@@ -229,7 +232,9 @@ class KeyManager {
     if (lowerMessage.includes('upstream error from nvidia') && 
         (lowerMessage.includes('resourceexhausted') || 
          lowerMessage.includes('rate limit') ||
-         lowerMessage.includes('limit reached'))) {
+         lowerMessage.includes('limit reached') ||
+         lowerMessage.includes('service temporarily overloaded') ||
+         lowerMessage.includes('overloaded'))) {
       return true;
     }
     
