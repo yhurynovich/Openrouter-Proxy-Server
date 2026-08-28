@@ -191,18 +191,25 @@ class KeyManager {
                          data.message || 
                          safeStringify(data);
     
-    return typeof errorMessage === 'string' && 
-           errorMessage.includes('Upstream error from Nvidia') && 
-           (errorMessage.includes('ResourceExhausted') || 
-            errorMessage.includes('rate limit') ||
-            errorMessage.includes('limit reached') ||
-            errorMessage.includes('Service temporarily overloaded') ||
-            errorMessage.includes('overloaded'));
+    if (typeof errorMessage !== 'string') return false;
+    
+    const lowerMessage = errorMessage.toLowerCase();
+    
+    return lowerMessage.includes('upstream error from nvidia') && 
+           (lowerMessage.includes('resourceexhausted') || 
+            lowerMessage.includes('rate limit') ||
+            lowerMessage.includes('limit reached') ||
+            lowerMessage.includes('service temporarily overloaded') ||
+            lowerMessage.includes('overloaded') ||
+            lowerMessage.includes('temporarily unavailable') ||
+            lowerMessage.includes('try again') ||
+            lowerMessage.includes('capacity'));
   }
 
   /**
    * Check if an error response contains any rate limit error
    * Handles NVIDIA, Xiaomi MiMo, and generic rate limit patterns
+   * Also checks response body for rate limit indicators regardless of HTTP status code
    */
   static isRateLimitError(error) {
     // Check HTTP status code first - 429 is definitive
@@ -275,6 +282,32 @@ class KeyManager {
         lowerMessage.includes('etimedout') ||
         lowerMessage.includes('econnaborted')) {
       return true;
+    }
+    
+    // Provider-specific transient error patterns that may appear with various status codes
+    // These patterns in the response body suggest a temporary issue worth retrying
+    const transientPatterns = [
+      'temporarily unavailable',
+      'service unavailable',
+      'try again later',
+      'try again in',
+      'please retry',
+      'capacity exceeded',
+      'model overloaded',
+      'provider overloaded',
+      'upstream error',
+      'gateway timeout',
+      'upstream timeout',
+      'rate limit',
+      'quota',
+      'throttl',
+      'too many requests',
+    ];
+    
+    for (const pattern of transientPatterns) {
+      if (lowerMessage.includes(pattern)) {
+        return true;
+      }
     }
     
     return false;
