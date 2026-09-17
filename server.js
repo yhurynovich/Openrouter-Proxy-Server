@@ -1010,7 +1010,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       const response = await axiosInstance.post(
         'https://openrouter.ai/api/v1/chat/completions',
-        req.body,
+        requestBody,
         axiosConfig
       );
 
