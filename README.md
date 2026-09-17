@@ -88,6 +88,13 @@ RATE_LIMIT_MAX=100                  # Max requests per window (default: 100)
 ADMIN_RATE_LIMIT_WINDOW_MS=60000    # Admin rate limit window in ms (default: 1 min)
 ADMIN_RATE_LIMIT_MAX=10             # Max admin requests per window (default: 10)
 
+# DNS Configuration
+# Set OPENROUTER_DNS_SERVERS when the container's default DNS is broken
+# (common in Docker on Synology NAS). Comma-separated list of DNS servers.
+# DNS resolution has its own timeout via DNS_LOOKUP_TIMEOUT_MS.
+OPENROUTER_DNS_SERVERS=             # Custom DNS servers for resolving openrouter.ai
+DNS_LOOKUP_TIMEOUT_MS=5000          # DNS lookup timeout in ms (default: 5000)
+
 # Request Limits
 BODY_LIMIT=5mb                      # Max request body size (default: 5mb)
 MAX_MESSAGE_LENGTH=100000           # Max characters per message (default: 100k)
@@ -276,7 +283,7 @@ graph TD
 The key rotation system implements:
 
 - **Sticky Sessions**: Uses same key for consecutive requests when possible
-- **Smart Cooldown**: Rate-limited keys enter cooldown based on rate limit headers
+- **Smart Cooldown**: Rate-limited keys enter cooldown based on rate limit headers. The proxy parses `ratelimit-reset`, `retry-after`, and similar headers from 429 responses to determine the exact reset time, then waits until that time before retrying — rather than using short exponential backoff that would result in repeated 429s.
 - **Failure Tracking**: Keys are deactivated after 5 consecutive failures
 - **Age-based Selection**: Rotates to least recently used available key
 - **Automatic Recovery**: Keys automatically reactivate after cooldown period
@@ -677,6 +684,10 @@ The codebase has been through multiple rounds of automated code review using the
 - Stream data sent flag prevents duplicate retries
 - Proper exit codes on failure
 - Automated model ID normalization
+
+## 📒 Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a detailed list of changes and fixes.
 
 ## 📜 License
 MIT © Adrian Belmans - See [LICENSE](LICENSE) for details
