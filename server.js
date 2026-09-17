@@ -4,6 +4,7 @@ import axios from 'axios';
 import rateLimit from 'express-rate-limit';
 import https from 'https';
 import http from 'http';
+import dns from 'dns';
 import { timingSafeEqual, randomUUID } from 'crypto';
 import keyManager, { KeyManager } from './services/KeyManager.js';
 import { requestLoggingMiddleware, logError, logInfo } from './services/logger.js';
@@ -47,8 +48,19 @@ const CONFIG = {
   SITE_NAME: process.env.SITE_NAME || 'OpenRouterProxy',
   // Admin endpoint stricter rate limiting
   ADMIN_RATE_LIMIT_WINDOW_MS: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '60000', 10),
-  ADMIN_RATE_LIMIT_MAX: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10', 10)
+  ADMIN_RATE_LIMIT_MAX: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10', 10),
+  // DNS configuration for resolving OpenRouter API hostname
+  // Useful when the container's default DNS is broken (common in Docker on Synology NAS)
+  OPENROUTER_DNS_SERVERS: process.env.OPENROUTER_DNS_SERVERS || '',
+  DNS_LOOKUP_TIMEOUT_MS: parseInt(process.env.DNS_LOOKUP_TIMEOUT_MS || '5000', 10),
 };
+
+// Configure custom DNS servers if provided (useful when container DNS is broken)
+const dnsServers = CONFIG.OPENROUTER_DNS_SERVERS.split(',').map(s => s.trim()).filter(Boolean);
+if (dnsServers.length > 0) {
+  dns.setServers(dnsServers);
+  console.log(`[DNS] Configured custom DNS servers: ${dnsServers.join(', ')}`);
+}
 
 // Model ID Normalization - Automated
 // Fetches models from OpenRouter and builds dynamic mapping
@@ -678,6 +690,28 @@ try {
   console.error('Error creating logs directory:', error);
 }
 
+// Custom DNS lookup function with timeout to prevent indefinite hangs during DNS resolution
+// (DNS resolution is not bounded by the axios timeout, so it needs its own safeguard)
+const customLookup = (hostname, options, callback) => {
+  const isAll = options?.all || false;
+  const timeout = setTimeout(() => {
+    const err = new Error(`DNS lookup timed out for ${hostname} after ${CONFIG.DNS_LOOKUP_TIMEOUT_MS}ms`);
+    err.code = 'DNS_LOOKUP_TIMEOUT';
+    callback(err);
+  }, CONFIG.DNS_LOOKUP_TIMEOUT_MS);
+
+  dns.lookup(hostname, options, (err, result, family) => {
+    clearTimeout(timeout);
+    if (err) {
+      callback(err);
+    } else if (isAll) {
+      callback(null, result);
+    } else {
+      callback(null, result, family);
+    }
+  });
+};
+
 // Create axios instance with connection pooling
 const keepaliveAgent = new https.Agent({
   keepAlive: true,
@@ -687,6 +721,7 @@ const keepaliveAgent = new https.Agent({
   freeSocketTimeout: CONFIG.AXIOS_FREE_SOCKET_TIMEOUT,
   // New: Set idle timeout to prevent upstream idle timeout
   keepAliveMsecs: CONFIG.AXIOS_IDLE_TIMEOUT,
+  lookup: customLookup,
 });
 
 const axiosInstance = axios.create({
@@ -697,6 +732,7 @@ const axiosInstance = axios.create({
     keepAlive: true, 
     maxSockets: CONFIG.AXIOS_MAX_SOCKETS,
     keepAliveMsecs: CONFIG.AXIOS_IDLE_TIMEOUT,
+    lookup: customLookup,
   }),
 });
 
@@ -1112,7 +1148,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         error.code === 'EAI_AGAIN' ||
         error.code === 'EHOSTUNREACH' ||
         error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED'
+        error.code === 'ECONNREFUSED' ||
+        error.code === 'DNS_LOOKUP_TIMEOUT'
       );
       
       // Check for idle timeout in error message
@@ -1314,7 +1351,8 @@ app.get('/v1/models', async (req, res) => {
         error.code === 'EAI_AGAIN' ||
         error.code === 'EHOSTUNREACH' ||
         error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED'
+        error.code === 'ECONNREFUSED' ||
+        error.code === 'DNS_LOOKUP_TIMEOUT'
       );
       
       // Check for idle timeout in error message
@@ -1590,7 +1628,8 @@ app.post('/v1/messages', async (req, res) => {
         error.code === 'EAI_AGAIN' ||
         error.code === 'EHOSTUNREACH' ||
         error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED'
+        error.code === 'ECONNREFUSED' ||
+        error.code === 'DNS_LOOKUP_TIMEOUT'
       );
       
       // Check for idle timeout in error message
