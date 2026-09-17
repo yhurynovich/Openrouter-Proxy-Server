@@ -2,6 +2,10 @@
 
 All notable changes to the OpenRouter Proxy Server are documented in this file.
 
+## Features
+
+- **Model failover** — When a model fails (overloaded, 5xx, or rate-limited across all API keys), the proxy automatically retries the request with the next model in a configurable failover group. The system tries other API accounts first (full key rotation cycle) before switching models. Configurable via `MODEL_FAILOVER_GROUPS` (JSON array of arrays) and `MAX_MODEL_FAILOVERS` environment variables. When failover occurs, the response includes an `X-Failover-Model: true` header and a log entry. Applies to `/v1/chat/completions` and `/v1/messages` endpoints `server.js:1004-107, 1600-1616, services/FailoverManager.js`.
+
 ## Fixes
 
 - **Model ID conversion on `/v1/chat/completions`** — The proxy was forwarding the original request body (with normalized model IDs like `gpt-4o`) to OpenRouter instead of the converted OpenRouter ID (like `openai/gpt-4o`), causing HTTP 400 errors. Fixed by sending the model-ID-converted `requestBody` to OpenRouter `server.js:1042-1049`.

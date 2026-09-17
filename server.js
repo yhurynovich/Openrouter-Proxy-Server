@@ -7,6 +7,7 @@ import http from 'http';
 import dns from 'dns';
 import { timingSafeEqual, randomUUID } from 'crypto';
 import keyManager, { KeyManager } from './services/KeyManager.js';
+import failoverManager from './services/FailoverManager.js';
 import { requestLoggingMiddleware, logError, logInfo } from './services/logger.js';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -53,6 +54,11 @@ const CONFIG = {
   // Useful when the container's default DNS is broken (common in Docker on Synology NAS)
   OPENROUTER_DNS_SERVERS: process.env.OPENROUTER_DNS_SERVERS || '',
   DNS_LOOKUP_TIMEOUT_MS: parseInt(process.env.DNS_LOOKUP_TIMEOUT_MS || '5000', 10),
+  // Model failover: JSON array of arrays defining interchangeable model groups
+  // e.g. [["modelA","modelB","modelC"]] means modelA fails over to modelB, then modelC
+  MODEL_FAILOVER_GROUPS: process.env.MODEL_FAILOVER_GROUPS || '',
+  // Max model switches per request (0 = unlimited, try all models in the group)
+  MAX_MODEL_FAILOVERS: parseInt(process.env.MAX_MODEL_FAILOVERS || '0', 10),
 };
 
 // Configure custom DNS servers if provided (useful when container DNS is broken)
@@ -788,7 +794,7 @@ const initializeKeys = async () => {
 let isReady = false;
 // Wait for initialization before accepting requests
 try {
-  await Promise.all([initializeKeys(), initializeModelIdMapping()]);
+  await Promise.all([initializeKeys(), initializeModelIdMapping(), failoverManager.initialize()]);
   isReady = true;
 } catch (error) {
   logError(error, { context: 'Key initialization' });
@@ -990,14 +996,38 @@ app.post('/v1/chat/completions', async (req, res) => {
   const requestId = randomUUID();
   // Use higher retry limit for rate limit errors (which are most common)
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
-  let retryCount = 0;
   const isStreaming = req.body?.stream === true;
-  let streamDataSent = false;
+
+  // Model failover: build chain of interchangeable models.
+  // The system tries other API accounts first (full retry cycle per model)
+  // before switching to the next model in the failover group.
+  const originalModel = req.body.model;
+  const failoverChain = failoverManager.getFailoverChain(originalModel) || [originalModel];
+  const maxFailoverSwitches = failoverManager.getMaxFailoverSwitches();
   const requestStartTime = Date.now();
 
-  while (retryCount < maxRetries) {
-    // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
-    const elapsedMs = Date.now() - requestStartTime;
+  for (let modelIdx = 0; modelIdx < failoverChain.length; modelIdx++) {
+    const currentFailoverModel = failoverChain[modelIdx];
+
+    if (modelIdx > 0) {
+      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
+      res.setHeader('X-Failover-Model', 'true');
+      if (modelIdx > maxFailoverSwitches) {
+        return res.status(503).json(normalizeErrorResponse(
+          'Max model failover attempts exceeded — all models unavailable',
+          503
+        ));
+      }
+    }
+
+    let retryCount = 0;
+    let streamDataSent = false;
+    let innerLoopError = null;
+    let innerLoopStatusCode = null;
+
+    while (retryCount < maxRetries) {
+      // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
+      const elapsedMs = Date.now() - requestStartTime;
     if (elapsedMs >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
       logError(new Error('Total request timeout exceeded'), {
         context: 'Chat completions',
@@ -1039,7 +1069,9 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
 
       // Convert normalized model ID back to OpenRouter ID if needed
+      // Use the current failover model (may differ from original request model)
       const requestBody = { ...req.body };
+      requestBody.model = currentFailoverModel;
       if (requestBody.model && REVERSE_MODEL_MAPPING.has(requestBody.model)) {
         requestBody.model = REVERSE_MODEL_MAPPING.get(requestBody.model);
       }
@@ -1080,9 +1112,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           throw error;
         }
         
-        // For other errors (validation, model not found, etc.), don't mark key as success
-        // but also don't retry - just return the error to client
+        // For other errors (validation, model not found, etc.), check if failoverable
         const statusCode = response.status || 400;
+        if (failoverManager.shouldFailover({ response: { status: statusCode, data: responseData } })) {
+          innerLoopError = responseData;
+          innerLoopStatusCode = statusCode;
+          break;
+        }
         return res.status(statusCode).json(normalizeErrorResponse(responseData, statusCode));
       }
 
@@ -1230,6 +1266,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         
         // Non-retryable error or max retries reached - end stream with error
+        // If no data sent yet and error is failoverable, break to outer loop
+        if (!streamDataSent && failoverManager.shouldFailover(error) && modelIdx < failoverChain.length - 1) {
+          innerLoopError = error;
+          innerLoopStatusCode = error.response?.status || 500;
+          break;
+        }
         if (!res.writableEnded) {
           res.write(normalizeStreamError(error, error.response?.status || 500));
           res.end();
@@ -1297,15 +1339,40 @@ app.post('/v1/chat/completions', async (req, res) => {
         streaming: isStreaming
       });
 
-      // For non-streaming requests, send error response
-      if (!isStreaming) {
-        const statusCode = error.response?.status || 500;
-        return res.status(statusCode).json(normalizeErrorResponse(error, statusCode));
+      // For streaming, the stream was already ended in the streaming path above
+      if (isStreaming) {
+        return;
       }
-      
-      // For streaming, we've already ended the response above
+
+      // For non-streaming, store error for outer loop (failover) consideration
+      innerLoopError = error;
+      innerLoopStatusCode = error.response?.status || 500;
+      break;
+    }
+  }
+    // End of inner retry loop
+
+    // Inner loop finished without success — check if we can failover
+    if (innerLoopError && !res.headersSent && failoverManager.shouldFailover(innerLoopError) && modelIdx < failoverChain.length - 1) {
+      continue;
+    }
+
+    // No more failover models, or error is not failoverable — return error to client
+    if (innerLoopError) {
+      if (isStreaming && !res.writableEnded) {
+        res.write(normalizeStreamError(innerLoopError, innerLoopStatusCode));
+        res.end();
+      } else if (!res.headersSent) {
+        return res.status(innerLoopStatusCode).json(normalizeErrorResponse(innerLoopError, innerLoopStatusCode));
+      }
       return;
     }
+  }
+  // End of outer failover loop — all models exhausted
+  if (!res.headersSent) {
+    return res.status(503).json(normalizeErrorResponse(
+      'All models in failover chain exhausted', 503
+    ));
   }
 });
 
@@ -1503,11 +1570,15 @@ app.post('/v1/messages', async (req, res) => {
   const requestId = randomUUID();
   // Use higher retry limit for rate limit errors
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
-  let retryCount = 0;
+
+  // Model failover: build chain of interchangeable models
+  const originalModel = req.body.model;
+  const failoverChain = failoverManager.getFailoverChain(originalModel) || [originalModel];
+  const maxFailoverSwitches = failoverManager.getMaxFailoverSwitches();
   const requestStartTime = Date.now();
-  
+
   // Transform Anthropic format to OpenAI format
-  const openAIBody = {
+  const baseOpenAIBody = {
     model: req.body.model,
     messages: req.body.messages.map(msg => {
       // Anthropic uses 'user'/'assistant' roles, OpenAI uses 'user'/'assistant'/'system'
@@ -1525,13 +1596,38 @@ app.post('/v1/messages', async (req, res) => {
     tools: req.body.tools,
     tool_choice: req.body.tool_choice,
   };
-  
-  // Add system message if provided (Anthropic has separate system param)
-  if (req.body.system) {
-    openAIBody.messages.unshift({ role: 'system', content: req.body.system });
-  }
-  
-  while (retryCount < maxRetries) {
+
+  for (let modelIdx = 0; modelIdx < failoverChain.length; modelIdx++) {
+    const currentFailoverModel = failoverChain[modelIdx];
+
+    if (modelIdx > 0) {
+      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
+      res.setHeader('X-Failover-Model', 'true');
+      if (modelIdx > maxFailoverSwitches) {
+        return res.status(503).json(normalizeErrorResponse(
+          'Max model failover attempts exceeded — all models unavailable',
+          503
+        ));
+      }
+    }
+
+    let retryCount = 0;
+    let innerLoopError = null;
+    let innerLoopStatusCode = null;
+
+    // Transform Anthropic format to OpenAI format (with current failover model)
+    const openAIBody = {
+      ...baseOpenAIBody,
+      model: currentFailoverModel,
+      messages: [...baseOpenAIBody.messages],
+    };
+
+    // Add system message if provided (Anthropic has separate system param)
+    if (req.body.system) {
+      openAIBody.messages.unshift({ role: 'system', content: req.body.system });
+    }
+
+    while (retryCount < maxRetries) {
     // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
     const elapsedMs = Date.now() - requestStartTime;
     if (elapsedMs >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
@@ -1611,6 +1707,11 @@ app.post('/v1/messages', async (req, res) => {
         }
         
         const statusCode = response.status || 400;
+        if (failoverManager.shouldFailover({ response: { status: statusCode, data: responseData } })) {
+          innerLoopError = responseData;
+          innerLoopStatusCode = statusCode;
+          break;
+        }
         return res.status(statusCode).json(normalizeErrorResponse(responseData, statusCode));
       }
       
@@ -1725,7 +1826,8 @@ app.post('/v1/messages', async (req, res) => {
       
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
-      if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+      // Don't retry if response has already started (streaming data sent)
+      if (!res.headersSent && (isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
         const elapsedBeforeRetry = Date.now() - requestStartTime;
         if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
@@ -1782,13 +1884,38 @@ app.post('/v1/messages', async (req, res) => {
         statusCode: error.response?.status,
       });
       
-      const statusCode = error.response?.status || 500;
-      return res.status(statusCode).json(normalizeErrorResponse(error, statusCode));
+      // Store error for outer loop (failover) consideration
+      innerLoopError = error;
+      innerLoopStatusCode = error.response?.status || 500;
+      break;
     }
+  }
+  // End of inner retry loop
+
+  // Inner loop finished without success — check if we can failover
+  // Don't failover if response has already started (streaming data sent)
+  if (innerLoopError && !res.headersSent && failoverManager.shouldFailover(innerLoopError) && modelIdx < failoverChain.length - 1) {
+    continue;
+  }
+
+  // No more failover models, or error is not failoverable — return error to client
+  if (innerLoopError) {
+    if (!res.headersSent) {
+      return res.status(innerLoopStatusCode).json(normalizeErrorResponse(innerLoopError, innerLoopStatusCode));
+    }
+    return;
+  }
+  }
+  // End of outer failover loop — all models exhausted
+  if (!res.headersSent) {
+    return res.status(503).json(normalizeErrorResponse(
+      'All models in failover chain exhausted', 503
+    ));
   }
 });
 
 // Error handling middleware
+
 app.use((err, req, res, next) => {
   logError(err, { 
     context: 'Global error handler',

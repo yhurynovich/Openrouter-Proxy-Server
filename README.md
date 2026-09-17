@@ -117,6 +117,11 @@ KEY_MAX_ROTATION_DEPTH=2            # Max key rotation recursion depth (default:
 KEY_MAX_FAILURE_COUNT=5             # Max failures before key deactivation (default: 5)
 KEY_REACTIVATION_FAILURE_REDUCTION=2 # Failure reduction on bulk reactivation (default: 2)
 
+# Model Failover
+MODEL_FAILOVER_GROUPS=[["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free"]]
+                                    # JSON array of arrays: interchangeable model groups
+MAX_MODEL_FAILOVERS=0                # Max model switches per request (0 = unlimited)
+
 # Logging
 LOG_LEVEL=warning                   # Global log level (error|warning|info|debug)
 LOG_RETENTION_DAYS=14               # Log retention in days (default: 14)
@@ -312,6 +317,62 @@ On startup, the server automatically fetches the model list from OpenRouter and 
 - **Self-updates** on every server restart
 
 The `/v1/models` endpoint returns normalized model IDs in OpenAI format.
+
+## 🔄 Model Failover
+
+When a model fails (overloaded, server error, or rate-limited across all API keys), the proxy can automatically retry the request with a different model from a configured failover group. The system always tries other API accounts first (full key rotation cycle) before switching models.
+
+### How It Works
+
+```mermaid
+graph TD
+    A[Request with Model M] --> B{Model M<br>in failover group?}
+    B -->|No| C[Standard retry<br>with key rotation]
+    B -->|Yes| D[Try Model M with<br>all available keys]
+    D --> E{Success?}
+    E -->|Yes| F[Return response]
+    E -->|No| G[Model M failed]
+    G --> H{More models in<br>failover group?}
+    H -->|Yes| I[Switch to next model<br>in group, try all keys]
+    H -->|No| J[Return last error]
+    I --> E
+```
+
+### Configuration
+
+Define failover groups via the `MODEL_FAILOVER_GROUPS` environment variable (JSON array of arrays):
+
+```env
+# Each inner array is an ordered group of interchangeable models.
+# If the first model fails (after trying all API keys), the next model is tried.
+MODEL_FAILOVER_GROUPS=[["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free","qwen/qwen-2.5-72b-instruct:free"]]
+MAX_MODEL_FAILOVERS=0          # 0 = unlimited switches within the group
+```
+
+- Models use OpenRouter format: `provider/model:tag`
+- The first model in each group is the primary (most preferred)
+- A model must be in a group to benefit from failover
+- `MAX_MODEL_FAILOVERS=0` (default) means try all models in the group
+- When failover occurs, the response includes an `X-Failover-Model: true` header
+
+### Error Triggers
+
+Failover is triggered after the full key rotation cycle is exhausted, for these error types:
+
+| Error Type | Failover? | Description |
+|---|---|---|
+| Rate limit (429) | Yes | All keys rate-limited — a different model may not be |
+| Server error (5xx) | Yes | Model overloaded or provider server error |
+| Model overloaded | Yes | Provider reports model is overloaded/capacity |
+| `NO_AVAILABLE_KEYS` | Yes | All keys exhausted (cooldown/deactivated) |
+| Model not found (404) | No | Model doesn't exist — returned to client |
+| Network errors | No | Not model-specific — returned to client |
+| Auth errors (401) | No | Key issue — returned to client |
+| Validation errors (400) | No | Client error — returned to client |
+
+### Streaming
+
+For streaming requests, failover only occurs if no data has been sent to the client yet. Once streaming begins, the response cannot be cleanly switched to a different model.
 
 ## 🔒 Security Features
 

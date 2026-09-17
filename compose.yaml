@@ -28,6 +28,10 @@ services:
       - LOG_RETENTION_DAYS=14
       # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
+      # Model failover: JSON array of arrays defining interchangeable model groups
+      # Leave empty to disable (default). Example:
+      # - MODEL_FAILOVER_GROUPS=[["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free"]]
+      - MODEL_FAILOVER_GROUPS=
     volumes:
       # Persist the whole data dir (dir-to-dir mount avoids the file/dir bind-mount gotcha)
       - /volume1/docker/openrouter_key_rotator/data:/app/data
