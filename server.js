@@ -1171,6 +1171,21 @@ app.post('/v1/chat/completions', async (req, res) => {
         const canRetryStream = (!streamDataSent || isRateLimit) && (isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1;
         
         if (canRetryStream) {
+          // If we've already spent more time than the total budget, don't retry
+          const elapsedBeforeRetry = Date.now() - requestStartTime;
+          if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+            logError(new Error('Total stream request timeout exceeded before retry'), {
+              context: 'Chat completions',
+              elapsedMs: elapsedBeforeRetry,
+              timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+              retryCount
+            });
+            if (!res.writableEnded) {
+              res.write(normalizeStreamError('Request timeout: total processing time exceeded limit', 504));
+              res.end();
+            }
+            return;
+          }
           // Retry on rate limit or network errors for streaming too
           retryCount++;
           
@@ -1178,17 +1193,21 @@ app.post('/v1/chat/completions', async (req, res) => {
           let waitMs = retryDelayMs;
           let waitReason = 'exponential backoff';
           
+          // Cap wait time at remaining timeout budget so total elapsed time
+          // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+          const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+          
           if (isRateLimit && error.response?.headers) {
             const resetDate = keyManager.parseRateLimitReset(error.response.headers);
             const resetWaitMs = resetDate.getTime() - Date.now();
-            if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+            if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
               waitMs = Math.max(retryDelayMs, resetWaitMs);
               waitReason = 'rate limit reset time';
             }
           }
           
           if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-            waitMs = error.minWaitMs;
+            waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
             waitReason = 'key reset time';
           }
           
@@ -1220,23 +1239,41 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Only retry on rate limits, server errors, or network errors
       if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+        // If we've already spent more time than the total budget, don't retry
+        const elapsedBeforeRetry = Date.now() - requestStartTime;
+        if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          logError(new Error('Total request timeout exceeded before retry'), {
+            context: 'Chat completions',
+            elapsedMs: elapsedBeforeRetry,
+            timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+            retryCount
+          });
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
+        }
         retryCount++;
         
         // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
         
+        // Cap wait time at remaining timeout budget so total elapsed time
+        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        
         if (isRateLimit && error.response?.headers) {
           const resetDate = keyManager.parseRateLimitReset(error.response.headers);
           const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
             waitMs = Math.max(retryDelayMs, resetWaitMs);
             waitReason = 'rate limit reset time';
           }
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = error.minWaitMs;
+          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
           waitReason = 'key reset time';
         }
         
@@ -1385,23 +1422,41 @@ app.get('/v1/models', async (req, res) => {
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
       if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+        // If we've already spent more time than the total budget, don't retry
+        const elapsedBeforeRetry = Date.now() - requestStartTime;
+        if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          logError(new Error('Total request timeout exceeded before retry'), {
+            context: 'Models endpoint',
+            elapsedMs: elapsedBeforeRetry,
+            timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+            retryCount
+          });
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
+        }
         retryCount++;
         
         // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
         
+        // Cap wait time at remaining timeout budget so total elapsed time
+        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        
         if (isRateLimit && error.response?.headers) {
           const resetDate = keyManager.parseRateLimitReset(error.response.headers);
           const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
             waitMs = Math.max(retryDelayMs, resetWaitMs);
             waitReason = 'rate limit reset time';
           }
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = error.minWaitMs;
+          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
           waitReason = 'key reset time';
         }
         
@@ -1671,23 +1726,41 @@ app.post('/v1/messages', async (req, res) => {
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
       if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+        // If we've already spent more time than the total budget, don't retry
+        const elapsedBeforeRetry = Date.now() - requestStartTime;
+        if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          logError(new Error('Total request timeout exceeded before retry'), {
+            context: 'Anthropic messages',
+            elapsedMs: elapsedBeforeRetry,
+            timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
+            retryCount
+          });
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
+        }
         retryCount++;
         
         // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
         
+        // Cap wait time at remaining timeout budget so total elapsed time
+        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        
         if (isRateLimit && error.response?.headers) {
           const resetDate = keyManager.parseRateLimitReset(error.response.headers);
           const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
             waitMs = Math.max(retryDelayMs, resetWaitMs);
             waitReason = 'rate limit reset time';
           }
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = error.minWaitMs;
+          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
           waitReason = 'key reset time';
         }
         
