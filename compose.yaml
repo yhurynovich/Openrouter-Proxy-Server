@@ -1,0 +1,35 @@
+services:
+  openrouter-proxy:
+    container_name: openrouter-proxy
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM node:20-alpine
+        WORKDIR /app
+        # Install Git, clone the repo, and install Node dependencies
+        RUN apk add --no-cache git && \
+            git clone https://github.com/yhurynovich/Openrouter-Proxy-Server.git . && \
+            npm install && \
+            printf '#!/bin/sh\nset -e\nmkdir -p /app/data\n[ -e /app/keys.json ] || ln -s /app/data/keys.json /app/keys.json\nexec "$@"\n' > /entrypoint.sh && \
+            chmod +x /entrypoint.sh
+        EXPOSE 3000
+        ENTRYPOINT ["/entrypoint.sh"]
+        CMD ["node", "server.js"]
+    # Expose port 4999 externally, mapping to 3000 internally
+    ports:
+      - "4999:3000"
+    # Sentinel policy: automatically restarts the container if it crashes or host reboots
+    restart: unless-stopped
+    # Lets you `docker exec -it openrouter-proxy node add-key.js` interactively
+    stdin_open: true
+    tty: true
+    environment:
+      - PORT=3000
+      - LOG_RETENTION_DAYS=14
+      # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
+      - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
+    volumes:
+      # Persist the whole data dir (dir-to-dir mount avoids the file/dir bind-mount gotcha)
+      - /volume1/docker/openrouter_key_rotator/data:/app/data
+      # Persist the proxy's logs to the host
+      - /volume1/docker/openrouter_key_rotator/data/logs:/app/logs

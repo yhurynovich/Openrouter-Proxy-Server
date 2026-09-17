@@ -1174,9 +1174,18 @@ app.post('/v1/chat/completions', async (req, res) => {
           // Retry on rate limit or network errors for streaming too
           retryCount++;
           
-          // Determine wait time: if no keys available, use the key reset time; otherwise exponential backoff
+          // Determine wait time: use rate limit reset time from headers if available
           let waitMs = retryDelayMs;
           let waitReason = 'exponential backoff';
+          
+          if (isRateLimit && error.response?.headers) {
+            const resetDate = keyManager.parseRateLimitReset(error.response.headers);
+            const resetWaitMs = resetDate.getTime() - Date.now();
+            if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+              waitMs = Math.max(retryDelayMs, resetWaitMs);
+              waitReason = 'rate limit reset time';
+            }
+          }
           
           if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
             waitMs = error.minWaitMs;
@@ -1213,9 +1222,18 @@ app.post('/v1/chat/completions', async (req, res) => {
       if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Determine wait time: if no keys available, use the key reset time; otherwise exponential backoff
+        // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
+        
+        if (isRateLimit && error.response?.headers) {
+          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
+          const resetWaitMs = resetDate.getTime() - Date.now();
+          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+            waitMs = Math.max(retryDelayMs, resetWaitMs);
+            waitReason = 'rate limit reset time';
+          }
+        }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
           waitMs = error.minWaitMs;
@@ -1369,9 +1387,18 @@ app.get('/v1/models', async (req, res) => {
       if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Determine wait time: if no keys available, use the key reset time; otherwise exponential backoff
+        // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
+        
+        if (isRateLimit && error.response?.headers) {
+          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
+          const resetWaitMs = resetDate.getTime() - Date.now();
+          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+            waitMs = Math.max(retryDelayMs, resetWaitMs);
+            waitReason = 'rate limit reset time';
+          }
+        }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
           waitMs = error.minWaitMs;
@@ -1646,9 +1673,18 @@ app.post('/v1/messages', async (req, res) => {
       if ((isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         retryCount++;
         
-        // Determine wait time: if no keys available, use the key reset time; otherwise exponential backoff
+        // Determine wait time: use rate limit reset time from headers if available
         let waitMs = retryDelayMs;
         let waitReason = 'exponential backoff';
+        
+        if (isRateLimit && error.response?.headers) {
+          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
+          const resetWaitMs = resetDate.getTime() - Date.now();
+          if (resetWaitMs > 0 && resetWaitMs <= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
+            waitMs = Math.max(retryDelayMs, resetWaitMs);
+            waitReason = 'rate limit reset time';
+          }
+        }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
           waitMs = error.minWaitMs;
