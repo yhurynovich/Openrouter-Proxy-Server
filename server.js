@@ -1336,7 +1336,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         context: 'Chat completions',
         retryCount,
         statusCode: error.response?.status,
-        streaming: isStreaming
+        streaming: isStreaming,
+        // Include OpenRouter error response body for debugging 400/5xx errors
+        responseData: error.response?.data,
+        // Include request details for debugging (sanitized by logger)
+        requestModel: currentFailoverModel,
+        requestBodyKeys: Object.keys(requestBody || {})
       });
 
       // For streaming, the stream was already ended in the streaming path above
@@ -1543,7 +1548,8 @@ app.get('/v1/models', async (req, res) => {
       logError(error, { 
         context: 'Models endpoint',
         retryCount,
-        statusCode: error.response?.status
+        statusCode: error.response?.status,
+        responseData: error.response?.data
       });
 
       const statusCode = error.response?.status || 500;
@@ -1882,6 +1888,7 @@ app.post('/v1/messages', async (req, res) => {
         context: 'Anthropic messages',
         retryCount,
         statusCode: error.response?.status,
+        responseData: error.response?.data
       });
       
       // Store error for outer loop (failover) consideration

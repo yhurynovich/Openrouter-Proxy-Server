@@ -28,10 +28,29 @@ services:
       - LOG_RETENTION_DAYS=14
       # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
-      # Model failover: JSON array of arrays defining interchangeable model groups
-      # Leave empty to disable (default). Example:
-      # - MODEL_FAILOVER_GROUPS=[["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free"]]
-      - MODEL_FAILOVER_GROUPS=
+      - LOG_LEVEL=debug
+      # ---- Retry Settings ----
+      - MAX_RETRIES=15                           # Max total retry attempts (rate limit + network)
+      - MAX_RATE_LIMIT_RETRIES=10                # Max retries specifically for rate limit (429) responses
+      - RETRY_DELAY_MS=1500                      # Base delay between retries (ms)
+      - TOTAL_REQUEST_TIMEOUT_MS=250000          # Hard cap on total request time incl. retries (ms)
+      # ---- OpenRouter Identification ----
+      - HTTP_REFERER=http://localhost:3000       # Referer header sent to OpenRouter
+      - SITE_NAME=Thinkotron                     # Site title sent to OpenRouter (X-Title)
+      # ---- Key Manager ----
+      - KEY_MAX_ROTATION_DEPTH=4                 # Max key rotation recursion depth
+      - KEY_MAX_FAILURE_COUNT=5                  # Failures before a key is deactivated
+      - KEY_REACTIVATION_FAILURE_REDUCTION=2     # Failure-count reduction on bulk reactivation
+      - KEY_BASE_RETRY_DELAY_MS=1500             # Base delay for exponential backoff (ms)
+      - KEY_MAX_RETRY_DELAY_MS=30000             # Capped max delay for exponential backoff (ms)
+      # ---- Model Failover ----
+      # When a model fails (overloaded, 5xx, or rate-limited across all keys),
+      # the request is retried with the next model in the group.
+      # The system tries other API accounts first (full key rotation) before switching models.
+      # JSON array of arrays: each inner array is an ordered group of interchangeable models.
+      # Example: [["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free","qwen/qwen-2.5-72b-instruct:free"]]
+      - MODEL_FAILOVER_GROUPS=[["z-ai/glm-5.2:free","qwen/qwen3.8-27b:free","inclusionai/ling-3.0-flash-vl:free"],["nvidia/nemotron-3-ultra-550b-a55b:free","inclusionai/ling-3.0-flash-fin:free","google/gemma-4-31b-it:free","google/gemma-4-26b-a4b-it:free","poolside/laguna-s-2.1:free"]]
+      - MAX_MODEL_FAILOVERS=0                    # Max model switches per request (0 = unlimited)
     volumes:
       # Persist the whole data dir (dir-to-dir mount avoids the file/dir bind-mount gotcha)
       - /volume1/docker/openrouter_key_rotator/data:/app/data
