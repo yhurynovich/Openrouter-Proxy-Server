@@ -1051,6 +1051,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
       const clientTitle = req.headers['x-title'];
       
+      // Cap per-request timeout to remaining total budget to prevent exceeding Cloudflare 100s
+      const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
       const axiosConfig = {
         headers: {
           'Content-Type': 'application/json',
@@ -1059,7 +1061,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: CONFIG.AXIOS_TIMEOUT,
+        timeout: Math.min(CONFIG.AXIOS_TIMEOUT, Math.max(1000, remainingMs)),
         signal: abortController.signal
       };
 
@@ -1273,7 +1275,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           break;
         }
         if (!res.writableEnded) {
-          res.write(normalizeStreamError(error, error.response?.status || 500));
+          const errorForResponse = error?.response?.data || error;
+          res.write(normalizeStreamError(errorForResponse, error.response?.status || 500));
           res.end();
         }
         return;
@@ -1364,11 +1367,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // No more failover models, or error is not failoverable — return error to client
     if (innerLoopError) {
+      // Extract response body from axios errors so the client gets the real OpenRouter error message
+      const errorForResponse = innerLoopError?.response?.data || innerLoopError;
       if (isStreaming && !res.writableEnded) {
-        res.write(normalizeStreamError(innerLoopError, innerLoopStatusCode));
+        res.write(normalizeStreamError(errorForResponse, innerLoopStatusCode));
         res.end();
       } else if (!res.headersSent) {
-        return res.status(innerLoopStatusCode).json(normalizeErrorResponse(innerLoopError, innerLoopStatusCode));
+        return res.status(innerLoopStatusCode).json(normalizeErrorResponse(errorForResponse, innerLoopStatusCode));
       }
       return;
     }
@@ -1420,7 +1425,8 @@ app.get('/v1/models', async (req, res) => {
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
       const clientTitle = req.headers['x-title'];
-      
+
+      const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
       const axiosConfig = {
         headers: {
           'Authorization': `Bearer ${currentKey}`,
@@ -1428,7 +1434,7 @@ app.get('/v1/models', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: CONFIG.MODELS_TIMEOUT,
+        timeout: Math.min(CONFIG.MODELS_TIMEOUT, Math.max(1000, remainingMs)),
       };
 
       const response = await axiosInstance.get(
@@ -1659,6 +1665,7 @@ app.post('/v1/messages', async (req, res) => {
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
       const clientTitle = req.headers['x-title'];
       
+      const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
       const axiosConfig = {
         headers: {
           'Content-Type': 'application/json',
@@ -1667,7 +1674,7 @@ app.post('/v1/messages', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: CONFIG.AXIOS_TIMEOUT,
+        timeout: Math.min(CONFIG.AXIOS_TIMEOUT, Math.max(1000, remainingMs)),
         signal: abortController.signal
       };
       
@@ -1907,8 +1914,9 @@ app.post('/v1/messages', async (req, res) => {
 
   // No more failover models, or error is not failoverable — return error to client
   if (innerLoopError) {
+    const errorForResponse = innerLoopError?.response?.data || innerLoopError;
     if (!res.headersSent) {
-      return res.status(innerLoopStatusCode).json(normalizeErrorResponse(innerLoopError, innerLoopStatusCode));
+      return res.status(innerLoopStatusCode).json(normalizeErrorResponse(errorForResponse, innerLoopStatusCode));
     }
     return;
   }
