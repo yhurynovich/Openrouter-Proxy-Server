@@ -107,9 +107,9 @@ class FailoverManager {
       : FAILOVER_CONFIG.MAX_MODEL_FAILOVERS;
   }
 
-  isModelOverloadedError(error) {
-    const data = error?.response?.data;
-    if (!data) return false;
+  _extractErrorMessage(error) {
+    const data = error?.response?.data || error;
+    if (!data || typeof data !== 'object') return '';
 
     const safeStringify = (obj) => {
       try {
@@ -119,9 +119,11 @@ class FailoverManager {
       }
     };
 
-    const errorMessage =
-      data.error?.message || data.message || safeStringify(data);
+    return data.error?.message || data.message || safeStringify(data);
+  }
 
+  isModelOverloadedError(error) {
+    const errorMessage = this._extractErrorMessage(error);
     if (typeof errorMessage !== 'string') return false;
 
     const lower = errorMessage.toLowerCase();
@@ -132,6 +134,21 @@ class FailoverManager {
       lower.includes('provider overloaded') ||
       lower.includes('no provider') ||
       lower.includes('temporarily unavailable')
+    );
+  }
+
+  isModelCapabilityError(error) {
+    const errorMessage = this._extractErrorMessage(error);
+    if (typeof errorMessage !== 'string') return false;
+
+    const lower = errorMessage.toLowerCase();
+
+    return (
+      lower.includes('no endpoints found that support') ||
+      lower.includes('tool use') ||
+      lower.includes('does not support') ||
+      lower.includes('unsupported') ||
+      lower.includes('provider routing')
     );
   }
 
@@ -146,6 +163,10 @@ class FailoverManager {
 
     if (status === 400 || status === 401 || status === 403) {
       return 'non_retryable';
+    }
+
+    if (status === 404 && this.isModelCapabilityError(error)) {
+      return 'capability_error';
     }
 
     if (status === 429) {
@@ -192,6 +213,10 @@ class FailoverManager {
     }
 
     if (status >= 500) {
+      return true;
+    }
+
+    if (status === 404 && this.isModelCapabilityError(error)) {
       return true;
     }
 
