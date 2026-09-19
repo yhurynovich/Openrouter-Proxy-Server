@@ -1024,6 +1024,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     let streamDataSent = false;
     let innerLoopError = null;
     let innerLoopStatusCode = null;
+    let requestBody;
+    let toolsStripped = false;
 
     while (retryCount < maxRetries) {
       // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
@@ -1072,7 +1074,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Convert normalized model ID back to OpenRouter ID if needed
       // Use the current failover model (may differ from original request model)
-      const requestBody = { ...req.body };
+      requestBody = { ...req.body };
+      if (toolsStripped) {
+        delete requestBody.tools;
+        delete requestBody.tool_choice;
+      }
       requestBody.model = currentFailoverModel;
       if (requestBody.model && REVERSE_MODEL_MAPPING.has(requestBody.model)) {
         requestBody.model = REVERSE_MODEL_MAPPING.get(requestBody.model);
@@ -1282,8 +1288,28 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // Only retry on rate limits, server errors, network errors, or exhausted keys
-      if ((isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+      // Check for 404 "No endpoints found that support tool use" — retry without tools
+        // This handles models that don't support function calling
+        const isToolCapabilityError = error.response?.status === 404 && errorMessage &&
+          errorMessage.toLowerCase().includes('no endpoints found that support') &&
+          errorMessage.toLowerCase().includes('tool use');
+        const requestHadTools = requestBody && (requestBody.tools || requestBody.tool_choice);
+
+        if (isToolCapabilityError && requestHadTools && retryCount < maxRetries - 1) {
+          // Mark that we should strip tools on the next attempt
+          toolsStripped = true;
+          logInfo('Model does not support tools, will retry without tools on next attempt', {
+            context: 'Retry',
+            model: currentFailoverModel,
+            errorMessage: errorMessage.substring(0, 200)
+          });
+          
+          // Continue to next iteration (will retry same model without tools)
+          continue;
+        }
+
+        // Only retry on rate limits, server errors, network errors, or exhausted keys
+        if ((isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
         const elapsedBeforeRetry = Date.now() - requestStartTime;
         if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {

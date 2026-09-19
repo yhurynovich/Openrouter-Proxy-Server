@@ -49,7 +49,7 @@ services:
       # The system tries other API accounts first (full key rotation) before switching models.
       # JSON array of arrays: each inner array is an ordered group of interchangeable models.
       # Example: [["deepseek/deepseek-chat:free","meta-llama/llama-3.1-8b-instruct:free","qwen/qwen-2.5-72b-instruct:free"]]
-      - MODEL_FAILOVER_GROUPS=[["z-ai/glm-5.2:free","z-ai/glm-5.3:free","qwen/qwen3.8-27b:free","thinkingmachines/inkling-small:free","thinkingmachines/inkling:free","inclusionai/ling-3.0-flash-vl:free","inclusionai/ling-3.0-flash-fin:free"],["nvidia/nemotron-3-ultra-550b-a55b:free","nvidia/nemotron-3-super-120b-a12b:free","google/gemma-4-31b-it:free","google/gemma-4-26b-a4b-it:free","cohere/north-mini-code:free","poolside/laguna-s-2.1:free","poolside/laguna-xs-2.1:free","deepseek/deepseek-v4-flash-0731:free"]]
+      - MODEL_FAILOVER_GROUPS=[["qwen/qwen3.8-27b:free","thinkingmachines/inkling-small:free","thinkingmachines/inkling:free","inclusionai/ling-3.0-flash-vl:free","inclusionai/ling-3.0-flash-fin:free","cohere/north-mini-code:free"],["nvidia/nemotron-3-super-120b-a12b:free","nvidia/nemotron-3-ultra-550b-a55b:free","google/gemma-4-31b-it:free","google/gemma-4-26b-a4b-it:free","poolside/laguna-s-2.1:free","poolside/laguna-xs-2.1:free","deepseek/deepseek-v4-flash-0731:free"]]
       - MAX_MODEL_FAILOVERS=0                    # Max model switches per request (0 = unlimited)
     volumes:
       # Persist the whole data dir (dir-to-dir mount avoids the file/dir bind-mount gotcha)

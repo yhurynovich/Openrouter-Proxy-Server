@@ -148,7 +148,8 @@ class FailoverManager {
       lower.includes('tool use') ||
       lower.includes('does not support') ||
       lower.includes('unsupported') ||
-      lower.includes('provider routing')
+      lower.includes('provider routing') ||
+      lower.includes('unavailable for free')
     );
   }
 
