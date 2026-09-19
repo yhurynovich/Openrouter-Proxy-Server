@@ -1,0 +1,12 @@
+.git
+.gitignore
+.mimocode
+node_modules
+package-lock.json
+.env
+data
+logs
+README.md
+CHANGELOG.md
+LICENSE
+image.png
