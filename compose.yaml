@@ -30,10 +30,10 @@ services:
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
       - LOG_LEVEL=warning
       # ---- Retry Settings ----
-      - MAX_RETRIES=15                           # Max total retry attempts (rate limit + network)
-      - MAX_RATE_LIMIT_RETRIES=10                # Max retries specifically for rate limit (429) responses
-      - RETRY_DELAY_MS=1500                      # Base delay between retries (ms)
-      - TOTAL_REQUEST_TIMEOUT_MS=250000          # Hard cap on total request time incl. retries (ms)
+      - MAX_RETRIES=5                            # Max total retry attempts (rate limit + network)
+      - MAX_RATE_LIMIT_RETRIES=5                 # Max retries specifically for rate limit (429) responses
+      - RETRY_DELAY_MS=1000                      # Base delay between retries (ms)
+      - TOTAL_REQUEST_TIMEOUT_MS=60000           # Hard cap on total request time incl. retries (60s)
       # ---- OpenRouter Identification ----
       - HTTP_REFERER=http://localhost:3000       # Referer header sent to OpenRouter
       - SITE_NAME=Thinkotron                     # Site title sent to OpenRouter (X-Title)
