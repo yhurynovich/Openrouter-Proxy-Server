@@ -1206,7 +1206,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         // For rate limits, we can retry even if some data was sent, but we need to be careful
         // If it's a rate limit and we haven't sent much data, retry with a new key
         // If it's a network error, retry regardless
-        const canRetryStream = (!streamDataSent || isRateLimit) && (isRateLimit || shouldRetryForNetwork) && retryCount < maxRetries - 1;
+        const canRetryStream = (!streamDataSent || isRateLimit) && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) && retryCount < maxRetries - 1;
         
         if (canRetryStream) {
           // If we've already spent more time than the total budget, don't retry
@@ -1249,8 +1249,8 @@ app.post('/v1/chat/completions', async (req, res) => {
             waitReason = 'key reset time';
           }
           
-          // Add delay for rate limits (exponential backoff or key reset time)
-          if (isRateLimit) {
+          // Add delay for rate limits, network errors, or exhausted keys
+          if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS') {
             const msg = `[Retry] Rate limit hit on stream, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
             logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: waitMs, waitReason });
             await new Promise(resolve => setTimeout(resolve, waitMs));
@@ -1282,8 +1282,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // Only retry on rate limits, server errors, or network errors
-      if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+      // Only retry on rate limits, server errors, network errors, or exhausted keys
+      if ((isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
         const elapsedBeforeRetry = Date.now() - requestStartTime;
         if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
@@ -1322,14 +1322,10 @@ app.post('/v1/chat/completions', async (req, res) => {
           waitReason = 'key reset time';
         }
         
-        // Add delay for rate limits
-        if (isRateLimit) {
-          const msg = `[Retry] Rate limit hit, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Retry', retryCount, delayMs: waitMs, waitReason });
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-        } else if (shouldRetryForNetwork) {
-          const msg = `[Retry] Network error: ${error.code || error.message}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
-          logInfo(msg, { context: 'Retry', retryCount, delayMs: waitMs, errorCode: error.code });
+        // Add delay for rate limits, network errors, or exhausted keys
+        if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
+          const msg = `[Retry] Error: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
+          logInfo(msg, { context: 'Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
@@ -1499,7 +1495,7 @@ app.get('/v1/models', async (req, res) => {
       
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
-      if ((isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+      if ((isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
         const elapsedBeforeRetry = Date.now() - requestStartTime;
         if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
@@ -1538,14 +1534,10 @@ app.get('/v1/models', async (req, res) => {
           waitReason = 'key reset time';
         }
         
-        // Add delay for rate limits (exponential backoff or key reset time)
-        if (isRateLimit) {
-          const msg = `[Retry] Rate limit hit on models, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: waitMs, waitReason });
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-        } else if (shouldRetryForNetwork) {
-          const msg = `[Retry] Network error on models: ${error.code || error.message}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
-          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: waitMs, errorCode: error.code });
+        // Add delay for rate limits, network errors, or exhausted keys
+        if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
+          const msg = `[Retry] Error on models: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
+          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
@@ -1840,7 +1832,7 @@ app.post('/v1/messages', async (req, res) => {
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
 
       // Don't retry if response has already started (streaming data sent)
-      if (!res.headersSent && (isRateLimit || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
+      if (!res.headersSent && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
         const elapsedBeforeRetry = Date.now() - requestStartTime;
         if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
@@ -1879,13 +1871,9 @@ app.post('/v1/messages', async (req, res) => {
           waitReason = 'key reset time';
         }
         
-        if (isRateLimit) {
-          const msg = `[Retry] Rate limit hit on Anthropic, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: waitMs, waitReason });
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-        } else if (shouldRetryForNetwork) {
-          const msg = `[Retry] Network error on Anthropic: ${error.code || error.message}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
-          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: waitMs, errorCode: error.code });
+        if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
+          const msg = `[Retry] Error on Anthropic: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
+          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
