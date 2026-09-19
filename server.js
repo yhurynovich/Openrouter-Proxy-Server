@@ -1341,7 +1341,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         responseData: error.response?.data,
         // Include request details for debugging (sanitized by logger)
         requestModel: currentFailoverModel,
-        requestBodyKeys: Object.keys(requestBody || {})
+        requestBodyKeys: Object.keys(req.body || {})
       });
 
       // For streaming, the stream was already ended in the streaming path above
