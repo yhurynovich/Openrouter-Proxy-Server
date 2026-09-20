@@ -1454,7 +1454,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const shouldRetryForNetwork = classified.shouldRetryForNetwork;
 
       // If the client disconnected, do NOT retry — downstream is gone
-      if (isClientDisconnect(abortController, classified)) {
+      if (isClientDisconnect(activeAbortController, classified)) {
         return;
       }
 
@@ -1719,7 +1719,7 @@ app.get('/v1/models', async (req, res) => {
       const shouldRetryForNetwork = classified.shouldRetryForNetwork;
 
       // If the client disconnected, do NOT retry — downstream is gone
-      if (isClientDisconnect(abortController, classified)) {
+      if (isClientDisconnect(activeAbortController, classified)) {
         return;
       }
 
@@ -2014,7 +2014,7 @@ app.post('/v1/messages', async (req, res) => {
       const shouldRetryForNetwork = classified.shouldRetryForNetwork;
 
       // If the client disconnected, do NOT retry — downstream is gone
-      if (isClientDisconnect(abortController, classified)) {
+      if (isClientDisconnect(activeAbortController, classified)) {
         return;
       }
 
