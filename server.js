@@ -12,61 +12,156 @@ import { requestLoggingMiddleware, logError, logInfo } from './services/logger.j
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdir } from 'fs/promises';
+import net from 'net';
 
 dotenv.config();
 
 // Sanitize header values to prevent header injection
 function sanitizeHeaderValue(value) {
   if (typeof value !== 'string') return '';
-  // Strip newlines and carriage returns, limit length
-  return value.replace(/[\r\n]/g, '').substring(0, 500);
+  // Strip newlines, carriage returns, and all C0 control characters + DEL
+  return value.replace(/[\x00-\x1F\x7F]/g, '').substring(0, 500);
+}
+
+const BLOCKED_HOSTNAMES = new Set([
+  'localhost', 'metadata.google.internal', 'metadata',
+]);
+
+// Check if an IP address (or hostname resolving to one) is in a private/reserved range
+function isPrivateOrInternal(hostname) {
+  if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) return true;
+  // Strip IPv6 brackets for [::1] format
+  const clean = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  // Check IPv4 patterns
+  if (/^0\./.test(clean)) return true;
+  if (/^127\./.test(clean)) return true;
+  if (/^10\./.test(clean)) return true;
+  if (/^100\.\d+\.\d+\.\d+$/.test(clean)) return true; // 100.64.0.0/10 CGNAT
+  if (/^169\.254\./.test(clean)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(clean)) return true; // 172.16.0.0/12
+  if (/^192\.168\./.test(clean)) return true;
+  // Check IPv6 patterns (including IPv4-mapped IPv6 ::ffff:127.0.0.1)
+  if (clean === '::1') return true;
+  if (clean.startsWith('::ffff:')) {
+    return isPrivateOrInternal(clean.slice(7)); // Strip ::ffff: prefix and re-check
+  }
+  if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // fc00::/7 ULA
+  if (clean.startsWith('fe80')) return true; // fe80::/10 link-local
+  if (clean === '0.0.0.0') return true;
+  return false;
+}
+
+// Safely stringify objects, falling back to String() on error
+function safeStringify(obj) {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return String(obj);
+  }
+}
+
+function validateImageUrl(url) {
+  if (typeof url !== 'string') return false;
+  if (url.length > 2048) return false;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return false;
+  const hostname = parsed.hostname;
+  if (hostname === 'localhost' || isPrivateOrInternal(hostname)) return false;
+  return true;
 }
 
 // Configuration constants
+// Parse integer from env with validation, clamping to [min, max]
+function parseIntEnv(name, defaultValue, min, max) {
+  const raw = process.env[name];
+  if (raw === undefined || raw === null || raw === '') {
+    return defaultValue;
+  }
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < min || parsed > max) {
+    return defaultValue;
+  }
+  return parsed;
+}
+
 const CONFIG = {
-  PORT: process.env.PORT || 3000,
+  PORT: parseIntEnv('PORT', 3000, 1, 65535),
   BODY_LIMIT: process.env.BODY_LIMIT || '5mb',
-  MAX_MESSAGE_LENGTH: parseInt(process.env.MAX_MESSAGE_LENGTH || '100000', 10),
-  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10),
-  RATE_LIMIT_MAX: parseInt(process.env.RATE_LIMIT_MAX || '100', 10),
+  MAX_MESSAGE_LENGTH: parseIntEnv('MAX_MESSAGE_LENGTH', 100000, 1, 1000000),
+  RATE_LIMIT_WINDOW_MS: parseIntEnv('RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000),
+  RATE_LIMIT_MAX: parseIntEnv('RATE_LIMIT_MAX', 100, 1, 10000),
   // Reduced from 120s to 60s to stay under Cloudflare's 100s timeout (error 524)
-  AXIOS_TIMEOUT: parseInt(process.env.AXIOS_TIMEOUT || '60000', 10),
-  AXIOS_MAX_SOCKETS: parseInt(process.env.AXIOS_MAX_SOCKETS || '50', 10),
-  AXIOS_MAX_FREE_SOCKETS: parseInt(process.env.AXIOS_MAX_FREE_SOCKETS || '10', 10),
-  AXIOS_KEEPALIVE_TIMEOUT: parseInt(process.env.AXIOS_KEEPALIVE_TIMEOUT || '60000', 10),
-  AXIOS_FREE_SOCKET_TIMEOUT: parseInt(process.env.AXIOS_FREE_SOCKET_TIMEOUT || '30000', 10),
+  AXIOS_TIMEOUT: parseIntEnv('AXIOS_TIMEOUT', 60000, 1000, 120000),
+  AXIOS_MAX_SOCKETS: parseIntEnv('AXIOS_MAX_SOCKETS', 50, 1, 1000),
+  AXIOS_MAX_FREE_SOCKETS: parseIntEnv('AXIOS_MAX_FREE_SOCKETS', 10, 1, 500),
+  AXIOS_KEEPALIVE_TIMEOUT: parseIntEnv('AXIOS_KEEPALIVE_TIMEOUT', 60000, 1000, 300000),
+  AXIOS_FREE_SOCKET_TIMEOUT: parseIntEnv('AXIOS_FREE_SOCKET_TIMEOUT', 30000, 1000, 300000),
   // New: Idle timeout for upstream connections (default 30s)
-  AXIOS_IDLE_TIMEOUT: parseInt(process.env.AXIOS_IDLE_TIMEOUT || '30000', 10),
-  MAX_RETRIES: parseInt(process.env.MAX_RETRIES || '5', 10),
+  AXIOS_IDLE_TIMEOUT: parseIntEnv('AXIOS_IDLE_TIMEOUT', 30000, 1000, 120000),
+  MAX_RETRIES: parseIntEnv('MAX_RETRIES', 5, 1, 20),
   // Reduced from 10 to 5 to limit total retry time
-  MAX_RATE_LIMIT_RETRIES: parseInt(process.env.MAX_RATE_LIMIT_RETRIES || '5', 10),
-  RETRY_DELAY_MS: parseInt(process.env.RETRY_DELAY_MS || '1000', 10),
+  MAX_RATE_LIMIT_RETRIES: parseIntEnv('MAX_RATE_LIMIT_RETRIES', 5, 1, 20),
+  RETRY_DELAY_MS: parseIntEnv('RETRY_DELAY_MS', 1000, 100, 30000),
   // Total request timeout including all retries (90s < Cloudflare's 100s)
-  TOTAL_REQUEST_TIMEOUT_MS: parseInt(process.env.TOTAL_REQUEST_TIMEOUT_MS || '90000', 10),
-  SSE_BUFFER_LIMIT: parseInt(process.env.SSE_BUFFER_LIMIT || String(10 * 1024 * 1024), 10),
-  MODELS_TIMEOUT: parseInt(process.env.MODELS_TIMEOUT || '30000', 10),
-  HTTP_REFERER: process.env.HTTP_REFERER || 'http://localhost:3000',
-  SITE_NAME: process.env.SITE_NAME || 'OpenRouterProxy',
+  TOTAL_REQUEST_TIMEOUT_MS: parseIntEnv('TOTAL_REQUEST_TIMEOUT_MS', 90000, 5000, 120000),
+  SSE_BUFFER_LIMIT: parseIntEnv('SSE_BUFFER_LIMIT', 10 * 1024 * 1024, 1024, 50 * 1024 * 1024),
+  SSE_MAX_EVENT_SIZE: 1024 * 1024, // 1 MB per SSE event
+  MODELS_TIMEOUT: parseIntEnv('MODELS_TIMEOUT', 30000, 1000, 60000),
+  HTTP_REFERER: sanitizeHeaderValue(process.env.HTTP_REFERER || 'http://localhost:3000'),
+  SITE_NAME: sanitizeHeaderValue(process.env.SITE_NAME || 'OpenRouterProxy'),
   // Admin endpoint stricter rate limiting
-  ADMIN_RATE_LIMIT_WINDOW_MS: parseInt(process.env.ADMIN_RATE_LIMIT_WINDOW_MS || '60000', 10),
-  ADMIN_RATE_LIMIT_MAX: parseInt(process.env.ADMIN_RATE_LIMIT_MAX || '10', 10),
+  ADMIN_RATE_LIMIT_WINDOW_MS: parseIntEnv('ADMIN_RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000),
+  ADMIN_RATE_LIMIT_MAX: parseIntEnv('ADMIN_RATE_LIMIT_MAX', 10, 1, 10000),
   // DNS configuration for resolving OpenRouter API hostname
   // Useful when the container's default DNS is broken (common in Docker on Synology NAS)
   OPENROUTER_DNS_SERVERS: process.env.OPENROUTER_DNS_SERVERS || '',
-  DNS_LOOKUP_TIMEOUT_MS: parseInt(process.env.DNS_LOOKUP_TIMEOUT_MS || '5000', 10),
+  DNS_LOOKUP_TIMEOUT_MS: parseIntEnv('DNS_LOOKUP_TIMEOUT_MS', 5000, 1000, 30000),
   // Model failover: JSON array of arrays defining interchangeable model groups
   // e.g. [["modelA","modelB","modelC"]] means modelA fails over to modelB, then modelC
   MODEL_FAILOVER_GROUPS: process.env.MODEL_FAILOVER_GROUPS || '',
   // Max model switches per request (0 = unlimited, try all models in the group)
-  MAX_MODEL_FAILOVERS: parseInt(process.env.MAX_MODEL_FAILOVERS || '0', 10),
+  MAX_MODEL_FAILOVERS: parseIntEnv('MAX_MODEL_FAILOVERS', 0, 0, 100),
+  MAX_MESSAGES: parseIntEnv('MAX_MESSAGES', 200, 1, 10000),
+  MAX_TOOL_CALLS: parseIntEnv('MAX_TOOL_CALLS', 100, 1, 10000),
+  MAX_MODEL_NAME_LENGTH: 200,
 };
 
-// Configure custom DNS servers if provided (useful when container DNS is broken)
-const dnsServers = CONFIG.OPENROUTER_DNS_SERVERS.split(',').map(s => s.trim()).filter(Boolean);
-if (dnsServers.length > 0) {
-  dns.setServers(dnsServers);
-  console.log(`[DNS] Configured custom DNS servers: ${dnsServers.join(', ')}`);
+// Create a DNS resolver instance for OpenRouter requests only (avoid global mutation)
+function createDnsResolver() {
+  const dnsServersRaw = CONFIG.OPENROUTER_DNS_SERVERS.split(',').map(s => s.trim()).filter(Boolean);
+  const validServers = [];
+
+  for (const s of dnsServersRaw) {
+    if (!s) continue;
+    const ipVersion = net.isIP(s);
+    if (ipVersion === 0) {
+      console.warn(`[DNS] Ignoring invalid DNS server IP: ${s}`);
+      continue;
+    }
+    if (isPrivateOrInternal(s)) {
+      console.warn(`[DNS] Skipping private/reserved DNS server: ${s}`);
+      continue;
+    }
+    validServers.push(s);
+  }
+
+  if (validServers.length === 0) {
+    return new dns.Resolver(); // Use system defaults (callback-based)
+  }
+
+  const resolver = new dns.Resolver();
+  resolver.setServers(validServers);
+  console.log(`[DNS] Configured custom DNS servers: ${validServers.join(', ')}`);
+  return resolver;
 }
+
+// Initialize a resolver for use in customLookup
+const dnsResolver = createDnsResolver();
 
 // Model ID Normalization - Automated
 // Fetches models from OpenRouter and builds dynamic mapping
@@ -75,7 +170,9 @@ let modelIdMappingLoaded = false;
 let modelIdMappingPromise = null;
 
 // Known fallback mappings for edge cases (models that don't follow provider/model pattern)
-const FALLBACK_MODEL_MAPPING = {
+// Use Object.create(null) to prevent prototype pollution via __proto__/constructor keys
+const FALLBACK_MODEL_MAPPING = Object.create(null);
+Object.assign(FALLBACK_MODEL_MAPPING, {
   // Free models with :free suffix
   'deepseek/deepseek-chat:free': 'deepseek-chat',
   'deepseek/deepseek-coder:free': 'deepseek-coder',
@@ -93,7 +190,7 @@ const FALLBACK_MODEL_MAPPING = {
   'cognitivecomputations/dolphin-2.9.2-qwen2-7b:free': 'dolphin-2.9.2-qwen2-7b',
   'sao10k/l3-70b-euryale-v2.1:free': 'l3-70b-euryale-v2.1',
   'liquid/lfm-40b:free': 'lfm-40b',
-};
+});
 
 // Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
 const REVERSE_MODEL_MAPPING = new Map();
@@ -108,6 +205,12 @@ for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING
  */
 function buildModelIdMapping(models) {
   const mapping = new Map();
+  // Clear reverse mapping to prevent stale entries from previous fetches
+  REVERSE_MODEL_MAPPING.clear();
+  // Re-populate from fallback mappings (fallback takes priority)
+  for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
+    REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
+  }
   
   if (!Array.isArray(models)) {
     return mapping;
@@ -120,17 +223,17 @@ function buildModelIdMapping(models) {
     let normalizedId = null;
     
     // Check fallback mappings first
-    if (FALLBACK_MODEL_MAPPING[openRouterId]) {
+    if (Object.prototype.hasOwnProperty.call(FALLBACK_MODEL_MAPPING, openRouterId)) {
       normalizedId = FALLBACK_MODEL_MAPPING[openRouterId];
     }
     // Try to extract base model name from provider/model format
     else {
-      const parts = openRouterId.split('/');
-      if (parts.length === 2) {
-        const baseName = parts[1];
+      const lastSlash = openRouterId.lastIndexOf('/');
+      if (lastSlash !== -1) {
+        const baseName = openRouterId.slice(lastSlash + 1);
         // Remove :free suffix if present
         normalizedId = baseName.replace(/:free$/, '');
-      } else if (parts.length === 1) {
+      } else {
         // Already a simple name
         normalizedId = openRouterId;
       }
@@ -138,9 +241,16 @@ function buildModelIdMapping(models) {
     
     if (normalizedId) {
       mapping.set(openRouterId, normalizedId);
-      // Also build reverse mapping (normalized -> OpenRouter)
-      // Only set if not already set (fallback takes priority)
-      if (!REVERSE_MODEL_MAPPING.has(normalizedId)) {
+      // Build reverse mapping (normalized -> OpenRouter) — clear first to prevent stale entries
+      // Only set if not already set (fallback takes priority), warn on collision
+      if (REVERSE_MODEL_MAPPING.has(normalizedId)) {
+        logInfo('Model ID collision in reverse mapping', {
+          context: 'ModelMapping',
+          normalizedId,
+          existing: REVERSE_MODEL_MAPPING.get(normalizedId),
+          new: openRouterId
+        });
+      } else {
         REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
       }
     }
@@ -176,17 +286,20 @@ async function fetchAndBuildModelIdMapping() {
       if (response.data && response.data.data) {
         modelIdMapping = buildModelIdMapping(response.data.data);
         modelIdMappingLoaded = true;
-        logInfo('Model ID mapping loaded', { 
-          context: 'ModelMapping', 
-          count: modelIdMapping.size 
+        logInfo('Model ID mapping loaded', {
+          context: 'ModelMapping',
+          count: modelIdMapping.size
         });
+      } else {
+        throw new Error('Invalid model list response shape from OpenRouter');
       }
     } catch (error) {
-      logError(error, { context: 'ModelMapping fetch failed' });
-      // Return empty map on failure - will use fallback logic
-      modelIdMapping = new Map();
-      modelIdMappingLoaded = true;
-    }
+       logError(error, { context: 'ModelMapping fetch failed' });
+       // Reset state to allow future retries
+       modelIdMapping = new Map();
+       modelIdMappingLoaded = false;
+       modelIdMappingPromise = null;
+     }
     
     return modelIdMapping;
   })();
@@ -210,15 +323,16 @@ function normalizeModelId(openRouterId) {
   }
   
   // Check fallback mappings
-  if (FALLBACK_MODEL_MAPPING[openRouterId]) {
+  if (Object.prototype.hasOwnProperty.call(FALLBACK_MODEL_MAPPING, openRouterId)) {
     return FALLBACK_MODEL_MAPPING[openRouterId];
   }
   
   // Try to extract base model name from provider/model format
   // e.g., "openai/gpt-4o" -> "gpt-4o"
-  const parts = openRouterId.split('/');
-  if (parts.length === 2) {
-    const baseName = parts[1];
+  // Use lastIndexOf to handle IDs with multiple slashes (e.g., "org/sub/model")
+  const lastSlash = openRouterId.lastIndexOf('/');
+  if (lastSlash !== -1) {
+    const baseName = openRouterId.slice(lastSlash + 1);
     // Remove :free suffix if present
     return baseName.replace(/:free$/, '');
   }
@@ -237,7 +351,7 @@ function normalizeModelObject(model) {
     return model;
   }
   
-  const normalized = { ...model };
+  const normalized = JSON.parse(JSON.stringify(model));
   
   // Normalize ID
   if (normalized.id) {
@@ -251,9 +365,9 @@ function normalizeModelObject(model) {
   
   if (!normalized.owned_by) {
     // Extract owner from original ID
-    const parts = (model.id || '').split('/');
-    if (parts.length === 2) {
-      normalized.owned_by = parts[0];
+    const lastSlash = (model.id || '').lastIndexOf('/');
+    if (lastSlash > 0) {
+      normalized.owned_by = (model.id || '').slice(0, lastSlash);
     } else {
       normalized.owned_by = 'openrouter';
     }
@@ -318,29 +432,40 @@ function normalizeErrorResponse(error, statusCode = 500) {
   
   if (error) {
     // Extract message from various error formats
-    if (error.message) {
-      message = error.message;
+    // Axios error shape: error.response.data.error.message
+    if (error.response?.data?.error?.message) {
+      message = error.response.data.error.message;
+    } else if (error.response?.data?.message) {
+      message = error.response.data.message;
     } else if (error.error && error.error.message) {
       message = error.error.message;
+    } else if (error.message) {
+      message = error.message;
     } else if (typeof error === 'string') {
       message = error;
     }
     
     // Extract type from OpenRouter error
-    if (error.error && error.error.type) {
+    if (error.response?.data?.error?.type) {
+      type = error.response.data.error.type;
+    } else if (error.error && error.error.type) {
       type = error.error.type;
     } else if (error.type) {
       type = error.type;
     }
     
     // Extract param and code if available
-    if (error.error && error.error.param) {
+    if (error.response?.data?.error?.param) {
+      param = error.response.data.error.param;
+    } else if (error.error && error.error.param) {
       param = error.error.param;
     } else if (error.param) {
       param = error.param;
     }
     
-    if (error.error && error.error.code) {
+    if (error.response?.data?.error?.code) {
+      code = error.response.data.error.code;
+    } else if (error.error && error.error.code) {
       code = error.error.code;
     } else if (error.code) {
       code = error.code;
@@ -362,9 +487,11 @@ function normalizeErrorResponse(error, statusCode = 500) {
     param = 'max_tokens';
   }
   
+  const sanitizedMessage = sanitizeClientMessage(message, statusCode);
+  
   const normalizedError = {
     error: {
-      message,
+      message: sanitizedMessage,
       type,
     }
   };
@@ -385,9 +512,47 @@ function normalizeErrorResponse(error, statusCode = 500) {
  * @param {number} statusCode - HTTP status code
  * @returns {string} SSE formatted error event
  */
+/**
+ * Sanitize error messages for client-facing responses
+ * For 5xx errors, hide internal details; for 4xx errors, redact sensitive patterns
+ */
+function sanitizeClientMessage(message, statusCode) {
+  if (statusCode >= 500) {
+    return 'Upstream service error';
+  }
+  // Redact API key patterns (sk-or-..., sk-..., etc.) from 4xx messages
+  return message.replace(/sk-[a-zA-Z0-9_-]{10,}/g, 'sk-***REDACTED***');
+}
+
 function normalizeStreamError(error, statusCode = 500) {
   const normalized = normalizeErrorResponse(error, statusCode);
   return `data: ${JSON.stringify(normalized)}\n\n`;
+}
+
+// Map OpenAI error format to Anthropic error format
+// Map OpenAI finish_reason to Anthropic stop_reason
+function mapFinishReason(finishReason) {
+  const mapping = {
+    'tool_calls': 'tool_use',
+    'function_calls': 'tool_use',
+    'length': 'max_tokens',
+    'stop': 'end_turn',
+    'content_filter': 'end_turn',
+  };
+  return mapping[finishReason] || 'end_turn';
+}
+
+// Map OpenAI error format to Anthropic error format
+function normalizeAnthropicError(openaiError, statusCode = 500) {
+  // For 4xx errors, preserve the message; for 5xx, use generic to avoid leaking internal details
+  const message = statusCode >= 500 ? 'Upstream service error' : openaiError.error?.message || 'Unknown error';
+  return {
+    type: 'error',
+    error: {
+      type: openaiError.error?.type || 'internal_error',
+      message,
+    }
+  };
 }
 
 // OpenAI Chat Completions Request Validation
@@ -403,10 +568,14 @@ function validateChatCompletionRequest(body) {
   
   if (!body.model || typeof body.model !== 'string') {
     errors.push('Field "model" is required and must be a string');
+  } else if (body.model.length > CONFIG.MAX_MODEL_NAME_LENGTH) {
+    errors.push('Field "model" exceeds maximum length');
   }
   
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     errors.push('Field "messages" is required and must be a non-empty array');
+  } else if (body.messages.length > CONFIG.MAX_MESSAGES) {
+    errors.push(`messages: exceeds maximum count of ${CONFIG.MAX_MESSAGES}`);
   } else {
     // Validate each message
     body.messages.forEach((msg, index) => {
@@ -443,6 +612,8 @@ function validateChatCompletionRequest(body) {
             } else if (part.type === 'image_url') {
               if (!part.image_url || typeof part.image_url.url !== 'string') {
                 errors.push(`messages[${index}].content[${partIndex}].image_url.url: must be a string`);
+              } else if (!validateImageUrl(part.image_url.url)) {
+                errors.push(`messages[${index}].content[${partIndex}].image_url.url: must be a valid HTTP(S) URL and must not point to private or internal addresses`);
               }
             } else {
               errors.push(`messages[${index}].content[${partIndex}].type: must be "text" or "image_url"`);
@@ -609,6 +780,8 @@ function validateChatCompletionRequest(body) {
   if (body.tools !== undefined) {
     if (!Array.isArray(body.tools)) {
       errors.push('tools: must be an array');
+    } else if (body.tools.length > CONFIG.MAX_TOOL_CALLS) {
+      errors.push(`tools: exceeds maximum count of ${CONFIG.MAX_TOOL_CALLS}`);
     } else {
       body.tools.forEach((tool, toolIndex) => {
         if (!tool || typeof tool !== 'object') {
@@ -700,20 +873,38 @@ try {
 // (DNS resolution is not bounded by the axios timeout, so it needs its own safeguard)
 const customLookup = (hostname, options, callback) => {
   const isAll = options?.all || false;
+  let called = false;
+  const callbackOnce = (err, result, family) => {
+    if (!called) {
+      called = true;
+      callback(err, result, family);
+    }
+  };
+
   const timeout = setTimeout(() => {
-    const err = new Error(`DNS lookup timed out for ${hostname} after ${CONFIG.DNS_LOOKUP_TIMEOUT_MS}ms`);
-    err.code = 'DNS_LOOKUP_TIMEOUT';
-    callback(err);
+    if (!called) {
+      const err = new Error(`DNS lookup timed out for ${hostname} after ${CONFIG.DNS_LOOKUP_TIMEOUT_MS}ms`);
+      err.code = 'DNS_LOOKUP_TIMEOUT';
+      callbackOnce(err);
+    }
   }, CONFIG.DNS_LOOKUP_TIMEOUT_MS);
 
-  dns.lookup(hostname, options, (err, result, family) => {
+  // Use the scoped resolver to avoid global DNS mutation
+  dnsResolver.resolve(hostname, (err, addresses) => {
     clearTimeout(timeout);
     if (err) {
-      callback(err);
-    } else if (isAll) {
-      callback(null, result);
+      callbackOnce(err);
     } else {
-      callback(null, result, family);
+      const isAll = options?.all || false;
+      if (isAll) {
+        const result = addresses.map(addr => ({
+          address: addr,
+          family: net.isIP(addr) === 6 ? 6 : 4
+        }));
+        callbackOnce(null, result);
+      } else {
+        callbackOnce(null, addresses[0], net.isIP(addresses[0]) === 6 ? 6 : 4);
+      }
     }
   });
 };
@@ -839,13 +1030,13 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
   res.setHeader('Connection', 'keep-alive');
 
   const MAX_BUFFER_SIZE = CONFIG.SSE_BUFFER_LIMIT;
-  const MAX_EVENT_SIZE = 1024 * 1024; // 1 MB per event
+  const MAX_EVENT_SIZE = CONFIG.SSE_MAX_EVENT_SIZE;
   let buffer = '';
   let nvidiaRateLimitDetected = false;
   let clientClosed = false;
 
   // Use AbortController to abort upstream request on client disconnect
-  req.on('close', () => {
+  req.once('close', () => {
     clientClosed = true;
     axiosResponse.data.destroy();
     abortController.abort();
@@ -875,6 +1066,7 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
               type: 'stream_error'
             }
           })}\n\n`);
+          res.write('data: [DONE]\n\n');
           res.end();
         }
         axiosResponse.data.destroy();
@@ -941,6 +1133,7 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
             type: 'stream_error'
           }
         })}\n\n`);
+        res.write('data: [DONE]\n\n');
         res.end();
       }
       axiosResponse.data.destroy();
@@ -1012,7 +1205,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (modelIdx > 0) {
       failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
       res.setHeader('X-Failover-Model', 'true');
-      if (modelIdx > maxFailoverSwitches) {
+      if (maxFailoverSwitches > 0 && modelIdx > maxFailoverSwitches) {
         return res.status(503).json(normalizeErrorResponse(
           'Max model failover attempts exceeded — all models unavailable',
           503
@@ -1048,6 +1241,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       // Create AbortController for client disconnect handling
       const abortController = new AbortController();
+      req.once('close', () => abortController.abort());
       
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
@@ -1155,13 +1349,6 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       // Check if it's a rate limit (for delay) - more robust detection
       const errorData = error.response?.data;
-      const safeStringify = (obj) => {
-        try {
-          return JSON.stringify(obj);
-        } catch {
-          return String(obj);
-        }
-      };
       const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       
       // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
@@ -1197,12 +1384,13 @@ app.post('/v1/chat/completions', async (req, res) => {
       );
       
       // Check for idle timeout in error message
+      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
       const isIdleTimeout = errorMessage && (
-        errorMessage.toLowerCase().includes('idle timeout') ||
-        errorMessage.toLowerCase().includes('upstream idle timeout') ||
-        errorMessage.toLowerCase().includes('connection timeout') ||
-        errorMessage.toLowerCase().includes('connection closed') ||
-        errorMessage.toLowerCase().includes('socket hang up')
+        lowerErrorMessage.includes('idle timeout') ||
+        lowerErrorMessage.includes('upstream idle timeout') ||
+        lowerErrorMessage.includes('connection timeout') ||
+        lowerErrorMessage.includes('connection closed') ||
+        lowerErrorMessage.includes('socket hang up')
       );
       
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
@@ -1212,7 +1400,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         // For rate limits, we can retry even if some data was sent, but we need to be careful
         // If it's a rate limit and we haven't sent much data, retry with a new key
         // If it's a network error, retry regardless
-        const canRetryStream = (!streamDataSent || isRateLimit) && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) && retryCount < maxRetries - 1;
+        const canRetryStream = !streamDataSent && !res.headersSent && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) && retryCount < maxRetries - 1;
         
         if (canRetryStream) {
           // If we've already spent more time than the total budget, don't retry
@@ -1444,6 +1632,10 @@ app.get('/v1/models', async (req, res) => {
     try {
       const currentKey = await keyManager.getKey();
       
+      // Create AbortController for client disconnect handling
+      const abortController = new AbortController();
+      req.once('close', () => abortController.abort());
+      
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
       const clientTitle = req.headers['x-title'];
@@ -1457,6 +1649,7 @@ app.get('/v1/models', async (req, res) => {
           'X-Request-ID': requestId
         },
         timeout: Math.min(CONFIG.MODELS_TIMEOUT, Math.max(1000, remainingMs)),
+        signal: abortController.signal
       };
 
       const response = await axiosInstance.get(
@@ -1477,9 +1670,6 @@ app.get('/v1/models', async (req, res) => {
       const keyRateLimit = await keyManager.markKeyError(error);
       
       const errorData = error.response?.data;
-      const safeStringify = (obj) => {
-        try { return JSON.stringify(obj); } catch { return String(obj); }
-      };
       const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       
       // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
@@ -1511,12 +1701,13 @@ app.get('/v1/models', async (req, res) => {
       );
       
       // Check for idle timeout in error message
+      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
       const isIdleTimeout = errorMessage && (
-        errorMessage.toLowerCase().includes('idle timeout') ||
-        errorMessage.toLowerCase().includes('upstream idle timeout') ||
-        errorMessage.toLowerCase().includes('connection timeout') ||
-        errorMessage.toLowerCase().includes('connection closed') ||
-        errorMessage.toLowerCase().includes('socket hang up')
+        lowerErrorMessage.includes('idle timeout') ||
+        lowerErrorMessage.includes('upstream idle timeout') ||
+        lowerErrorMessage.includes('connection timeout') ||
+        lowerErrorMessage.includes('connection closed') ||
+        lowerErrorMessage.includes('socket hang up')
       );
       
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
@@ -1633,7 +1824,7 @@ app.post('/v1/messages', async (req, res) => {
     if (modelIdx > 0) {
       failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
       res.setHeader('X-Failover-Model', 'true');
-      if (modelIdx > maxFailoverSwitches) {
+      if (maxFailoverSwitches > 0 && modelIdx > maxFailoverSwitches) {
         return res.status(503).json(normalizeErrorResponse(
           'Max model failover attempts exceeded — all models unavailable',
           503
@@ -1678,6 +1869,7 @@ app.post('/v1/messages', async (req, res) => {
       
       // Create AbortController for client disconnect handling
       const abortController = new AbortController();
+      req.once('close', () => abortController.abort());
       
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
@@ -1743,19 +1935,32 @@ app.post('/v1/messages', async (req, res) => {
           innerLoopStatusCode = statusCode;
           break;
         }
-        return res.status(statusCode).json(normalizeErrorResponse(responseData, statusCode));
+        return res.status(statusCode).json(normalizeAnthropicError(normalizeErrorResponse(responseData, statusCode), statusCode));
       }
       
       await keyManager.markKeySuccess();
       
-      // Transform OpenAI response to Anthropic format
+      // Handle streaming — Anthropic SSE format differs from OpenAI SSE.
+      // Raw OpenAI chunks cannot be forwarded to Anthropic clients. Return 501
+      // until a proper SSE translation layer is implemented.
+      if (openAIBody.stream) {
+        return res.status(501).json({
+          type: 'error',
+          error: {
+            type: 'not_implemented',
+            message: 'Streaming is not yet supported for the Anthropic Messages endpoint',
+          }
+        });
+      }
+      
+      // Non-streaming: parse and transform response
       const anthropicResponse = {
         id: responseData.id?.replace('chatcmpl-', 'msg_') || `msg_${Date.now()}`,
         type: 'message',
         role: 'assistant',
         content: [],
         model: responseData.model,
-        stop_reason: responseData.choices?.[0]?.finish_reason === 'tool_calls' ? 'tool_use' : 'end_turn',
+        stop_reason: mapFinishReason(responseData.choices?.[0]?.finish_reason),
         stop_sequence: null,
         usage: {
           input_tokens: responseData.usage?.prompt_tokens || 0,
@@ -1776,35 +1981,20 @@ app.post('/v1/messages', async (req, res) => {
       if (choice?.message?.tool_calls) {
         anthropicResponse.stop_reason = 'tool_use';
         choice.message.tool_calls.forEach(tc => {
+          let parsedInput = {};
+          try {
+            parsedInput = JSON.parse(tc.function.arguments);
+          } catch {
+            // Pass raw string if JSON parsing fails — don't retry on parse errors
+            parsedInput = { _raw: tc.function.arguments };
+          }
           anthropicResponse.content.push({
             type: 'tool_use',
             id: tc.id,
             name: tc.function.name,
-            input: JSON.parse(tc.function.arguments)
+            input: parsedInput
           });
         });
-      }
-      
-      // Handle streaming
-      if (openAIBody.stream) {
-        // For streaming, we need to transform SSE events
-        // This is complex - for now, return a simple response
-        // TODO: Implement full streaming transformation
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        
-        // Send initial event
-        res.write(`data: ${JSON.stringify({ type: 'message_start', message: anthropicResponse })}\n\n`);
-        
-        // For now, just forward the stream - proper transformation would require parsing each SSE event
-        for await (const chunk of response.data) {
-          res.write(chunk);
-        }
-        res.write(`data: ${JSON.stringify({ type: 'message_delta', delta: { stop_reason: 'end_turn' } })}\n\n`);
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
       }
       
       return res.json(anthropicResponse);
@@ -1813,9 +2003,6 @@ app.post('/v1/messages', async (req, res) => {
       const keyRateLimit = await keyManager.markKeyError(error);
       
       const errorData = error.response?.data;
-      const safeStringify = (obj) => {
-        try { return JSON.stringify(obj); } catch { return String(obj); }
-      };
       const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
       
       // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
@@ -1847,12 +2034,13 @@ app.post('/v1/messages', async (req, res) => {
       );
       
       // Check for idle timeout in error message
+      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
       const isIdleTimeout = errorMessage && (
-        errorMessage.toLowerCase().includes('idle timeout') ||
-        errorMessage.toLowerCase().includes('upstream idle timeout') ||
-        errorMessage.toLowerCase().includes('connection timeout') ||
-        errorMessage.toLowerCase().includes('connection closed') ||
-        errorMessage.toLowerCase().includes('socket hang up')
+        lowerErrorMessage.includes('idle timeout') ||
+        lowerErrorMessage.includes('upstream idle timeout') ||
+        lowerErrorMessage.includes('connection timeout') ||
+        lowerErrorMessage.includes('connection closed') ||
+        lowerErrorMessage.includes('socket hang up')
       );
       
       const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
@@ -1930,15 +2118,16 @@ app.post('/v1/messages', async (req, res) => {
   if (innerLoopError) {
     const errorForResponse = innerLoopError?.response?.data || innerLoopError;
     if (!res.headersSent) {
-      return res.status(innerLoopStatusCode).json(normalizeErrorResponse(errorForResponse, innerLoopStatusCode));
+      return res.status(innerLoopStatusCode).json(normalizeAnthropicError(normalizeErrorResponse(errorForResponse, innerLoopStatusCode), innerLoopStatusCode));
     }
     return;
   }
   }
   // End of outer failover loop — all models exhausted
   if (!res.headersSent) {
-    return res.status(503).json(normalizeErrorResponse(
-      'All models in failover chain exhausted', 503
+    return res.status(503).json(normalizeAnthropicError(
+      normalizeErrorResponse('All models in failover chain exhausted', 503),
+      503
     ));
   }
 });
@@ -1946,12 +2135,16 @@ app.post('/v1/messages', async (req, res) => {
 // Error handling middleware
 
 app.use((err, req, res, next) => {
-  logError(err, { 
+  logError(err, {
     context: 'Global error handler',
     url: req.url,
     method: req.method
   });
-  
+
+  if (res.headersSent) {
+    return next(err);
+  }
+
   res.status(500).json({
     error: {
       message: 'Internal server error',
