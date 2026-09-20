@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { mkdir } from 'fs/promises';
 import net from 'net';
 import ipaddr from 'ipaddr.js';
+import { createAbortSignal, classifyError, isRateLimitError, calculateRetryDelay, isClientDisconnect, logRetry, checkTotalTimeout } from './services/RetryHelper.js';
 
 dotenv.config();
 
@@ -1353,7 +1354,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'X-Request-ID': requestId
         },
         timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
-        signal: abortController.signal
+        signal: createAbortSignal(abortController, remainingMs)
       };
 
       // Add responseType: 'stream' for streaming requests
@@ -1446,54 +1447,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     } catch (error) {
       
       const keyRateLimit = await keyManager.markKeyError(error);
-
-      // Check if it's a rate limit (for delay) - more robust detection
-      const errorData = error.response?.data;
-      const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
-      
-      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
-      const isRateLimitFromResponse = KeyManager.isRateLimitError({
-        response: {
-          data: errorData,
-          status: error.response?.status,
-          headers: error.response?.headers
-        }
-      });
-      
-      const isRateLimitFromError = error.isRateLimit === true;
-      
-      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
-      // Combine with other detection methods for robustness
-      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
-      
-      // Calculate retry delay with exponential backoff
+      const classified = classifyError(error);
+      const isRateLimit = isRateLimitError({ keyRateLimit, classified });
       const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
+      const errorMessage = classified.errorMessage;
+      const shouldRetryForNetwork = classified.shouldRetryForNetwork;
 
-      // Check for network errors that should trigger a retry
-      const isNetworkError = error.code && (
-        error.code === 'ECONNRESET' ||
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ECONNABORTED' ||
-        error.code === 'ENOTFOUND' ||
-        error.code === 'ENETUNREACH' ||
-        error.code === 'EAI_AGAIN' ||
-        error.code === 'EHOSTUNREACH' ||
-        error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED' ||
-        error.code === 'DNS_LOOKUP_TIMEOUT'
-      );
-      
-      // Check for idle timeout in error message
-      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
-      const isIdleTimeout = errorMessage && (
-        lowerErrorMessage.includes('idle timeout') ||
-        lowerErrorMessage.includes('upstream idle timeout') ||
-        lowerErrorMessage.includes('connection timeout') ||
-        lowerErrorMessage.includes('connection closed') ||
-        lowerErrorMessage.includes('socket hang up')
-      );
-      
-      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
+      // If the client disconnected, do NOT retry — downstream is gone
+      if (isClientDisconnect(abortController, classified)) {
+        return;
+      }
 
       // Handle streaming errors - retry on rate limits or network errors, otherwise end stream
       if (isStreaming) {
@@ -1521,41 +1484,23 @@ app.post('/v1/chat/completions', async (req, res) => {
           // Retry on rate limit or network errors for streaming too
           retryCount++;
           
-          // Determine wait time: use rate limit reset time from headers if available
-          let waitMs = retryDelayMs;
-          let waitReason = 'exponential backoff';
-          
-          // Cap wait time at remaining timeout budget so total elapsed time
-          // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+          // Determine wait time using shared helper (caps at remaining budget)
           const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+          const { waitMs, waitReason, shouldAbort } = calculateRetryDelay({
+            error, isRateLimit, retryCount, keyManager, remainingMs, retryDelayMs
+          });
           
-          if (isRateLimit && error.response?.headers) {
-            const resetDate = keyManager.parseRateLimitReset(error.response.headers);
-            const resetWaitMs = resetDate.getTime() - Date.now();
-            if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
-              waitMs = Math.max(retryDelayMs, resetWaitMs);
-              waitReason = 'rate limit reset time';
+          if (shouldAbort) {
+            if (!res.writableEnded) {
+              res.write(normalizeStreamError({ error: { message: 'Request timeout: total processing time exceeded limit', type: 'timeout' } }, 504));
+              res.end();
             }
-          }
-          
-          if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-            if (error.minWaitMs > remainingMs) {
-              waitMs = 0;
-              waitReason = 'key reset exceeds budget';
-            } else {
-              waitMs = error.minWaitMs;
-              waitReason = 'key reset time';
-            }
+            return;
           }
           
           // Add delay for rate limits, network errors, or exhausted keys
-          if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS') {
-            const msg = `[Retry] Rate limit hit on stream, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: waitMs, waitReason });
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-          } else if (shouldRetryForNetwork) {
-            const msg = `[Retry] Network error on stream: ${error.code || error.message}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries})...`;
-            logInfo(msg, { context: 'Stream Retry', retryCount, delayMs: waitMs, errorCode: error.code });
+          if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
+            logRetry('stream', { retryCount, maxRetries, waitMs, waitReason, errorCode: error.code, errorMessage });
             await new Promise(resolve => setTimeout(resolve, waitMs));
           }
           
@@ -1620,37 +1565,22 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         retryCount++;
         
-        // Determine wait time: use rate limit reset time from headers if available
-        let waitMs = retryDelayMs;
-        let waitReason = 'exponential backoff';
-        
-        // Cap wait time at remaining timeout budget so total elapsed time
-        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        // Determine wait time using shared helper (caps at remaining budget)
         const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        const { waitMs, waitReason, shouldAbort } = calculateRetryDelay({
+          error, isRateLimit, retryCount, keyManager, remainingMs, retryDelayMs
+        });
         
-        if (isRateLimit && error.response?.headers) {
-          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
-          const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
-            waitMs = Math.max(retryDelayMs, resetWaitMs);
-            waitReason = 'rate limit reset time';
-          }
-        }
-        
-        if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          if (error.minWaitMs > remainingMs) {
-            waitMs = 0;
-            waitReason = 'key reset exceeds budget';
-          } else {
-            waitMs = error.minWaitMs;
-            waitReason = 'key reset time';
-          }
+        if (shouldAbort) {
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
         }
         
         // Add delay for rate limits, network errors, or exhausted keys
         if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
-          const msg = `[Retry] Error: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
+          logRetry('chat completions', { retryCount, maxRetries, waitMs, waitReason, errorCode: error.code, errorMessage });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
@@ -1763,7 +1693,7 @@ app.get('/v1/models', async (req, res) => {
           'X-Request-ID': requestId
         },
         timeout: Math.max(100, Math.min(CONFIG.MODELS_TIMEOUT, remainingMs)),
-        signal: abortController.signal
+        signal: createAbortSignal(abortController, remainingMs)
       };
 
       const response = await axiosInstance.get(
@@ -1782,49 +1712,16 @@ app.get('/v1/models', async (req, res) => {
       return res.json(responseData);
     } catch (error) {
       const keyRateLimit = await keyManager.markKeyError(error);
-      
-      const errorData = error.response?.data;
-      const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
-      
-      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
-      const isRateLimitFromResponse = KeyManager.isRateLimitError({
-        response: { data: errorData, status: error.response?.status, headers: error.response?.headers }
-      });
-      
-      const isRateLimitFromError = error.isRateLimit === true;
-      
-      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
-      // Combine with other detection methods for robustness
-      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
-      
-      // Calculate retry delay with exponential backoff
+      const classified = classifyError(error);
+      const isRateLimit = isRateLimitError({ keyRateLimit, classified });
       const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
-      
-      // Check for network errors that should trigger a retry
-      const isNetworkError = error.code && (
-        error.code === 'ECONNRESET' ||
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ECONNABORTED' ||
-        error.code === 'ENOTFOUND' ||
-        error.code === 'ENETUNREACH' ||
-        error.code === 'EAI_AGAIN' ||
-        error.code === 'EHOSTUNREACH' ||
-        error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED' ||
-        error.code === 'DNS_LOOKUP_TIMEOUT'
-      );
-      
-      // Check for idle timeout in error message
-      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
-      const isIdleTimeout = errorMessage && (
-        lowerErrorMessage.includes('idle timeout') ||
-        lowerErrorMessage.includes('upstream idle timeout') ||
-        lowerErrorMessage.includes('connection timeout') ||
-        lowerErrorMessage.includes('connection closed') ||
-        lowerErrorMessage.includes('socket hang up')
-      );
-      
-      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
+      const errorMessage = classified.errorMessage;
+      const shouldRetryForNetwork = classified.shouldRetryForNetwork;
+
+      // If the client disconnected, do NOT retry — downstream is gone
+      if (isClientDisconnect(abortController, classified)) {
+        return;
+      }
 
       if ((isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
         // If we've already spent more time than the total budget, don't retry
@@ -1843,37 +1740,22 @@ app.get('/v1/models', async (req, res) => {
         }
         retryCount++;
         
-        // Determine wait time: use rate limit reset time from headers if available
-        let waitMs = retryDelayMs;
-        let waitReason = 'exponential backoff';
-        
-        // Cap wait time at remaining timeout budget so total elapsed time
-        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        // Determine wait time using shared helper (caps at remaining budget)
         const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        const { waitMs, waitReason, shouldAbort } = calculateRetryDelay({
+          error, isRateLimit, retryCount, keyManager, remainingMs, retryDelayMs
+        });
         
-        if (isRateLimit && error.response?.headers) {
-          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
-          const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
-            waitMs = Math.max(retryDelayMs, resetWaitMs);
-            waitReason = 'rate limit reset time';
-          }
-        }
-        
-        if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          if (error.minWaitMs > remainingMs) {
-            waitMs = 0;
-            waitReason = 'key reset exceeds budget';
-          } else {
-            waitMs = error.minWaitMs;
-            waitReason = 'key reset time';
-          }
+        if (shouldAbort) {
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
         }
         
         // Add delay for rate limits, network errors, or exhausted keys
         if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
-          const msg = `[Retry] Error on models: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Models Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
+          logRetry('models', { retryCount, maxRetries, waitMs, waitReason, errorCode: error.code, errorMessage });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
@@ -2013,7 +1895,7 @@ app.post('/v1/messages', async (req, res) => {
           'X-Request-ID': requestId
         },
         timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
-        signal: abortController.signal
+        signal: createAbortSignal(abortController, remainingMs)
       };
       
       // Reject streaming early — Anthropic SSE format differs from OpenAI SSE
@@ -2125,49 +2007,16 @@ app.post('/v1/messages', async (req, res) => {
       
     } catch (error) {
       const keyRateLimit = await keyManager.markKeyError(error);
-      
-      const errorData = error.response?.data;
-      const errorMessage = errorData?.error?.message || errorData?.message || safeStringify(errorData);
-      
-      // Use centralized rate limit detection (handles NVIDIA, Xiaomi MiMo, and generic)
-      const isRateLimitFromResponse = KeyManager.isRateLimitError({
-        response: { data: errorData, status: error.response?.status, headers: error.response?.headers }
-      });
-      
-      const isRateLimitFromError = error.isRateLimit === true;
-      
-      // Use keyRateLimit (from markKeyError) as the primary indicator since it also checks HTTP 429
-      // Combine with other detection methods for robustness
-      const isRateLimit = keyRateLimit || isRateLimitFromResponse || isRateLimitFromError;
-      
-      // Calculate retry delay with exponential backoff
+      const classified = classifyError(error);
+      const isRateLimit = isRateLimitError({ keyRateLimit, classified });
       const retryDelayMs = keyManager.calculateRetryDelay ? keyManager.calculateRetryDelay(retryCount) : CONFIG.RETRY_DELAY_MS;
-      
-      // Check for network errors that should trigger a retry
-      const isNetworkError = error.code && (
-        error.code === 'ECONNRESET' ||
-        error.code === 'ETIMEDOUT' ||
-        error.code === 'ECONNABORTED' ||
-        error.code === 'ENOTFOUND' ||
-        error.code === 'ENETUNREACH' ||
-        error.code === 'EAI_AGAIN' ||
-        error.code === 'EHOSTUNREACH' ||
-        error.code === 'EPIPE' ||
-        error.code === 'ECONNREFUSED' ||
-        error.code === 'DNS_LOOKUP_TIMEOUT'
-      );
-      
-      // Check for idle timeout in error message
-      const lowerErrorMessage = errorMessage?.toLowerCase() || '';
-      const isIdleTimeout = errorMessage && (
-        lowerErrorMessage.includes('idle timeout') ||
-        lowerErrorMessage.includes('upstream idle timeout') ||
-        lowerErrorMessage.includes('connection timeout') ||
-        lowerErrorMessage.includes('connection closed') ||
-        lowerErrorMessage.includes('socket hang up')
-      );
-      
-      const shouldRetryForNetwork = isNetworkError || isIdleTimeout;
+      const errorMessage = classified.errorMessage;
+      const shouldRetryForNetwork = classified.shouldRetryForNetwork;
+
+      // If the client disconnected, do NOT retry — downstream is gone
+      if (isClientDisconnect(abortController, classified)) {
+        return;
+      }
 
       // Don't retry if response has already started (streaming data sent)
       if (!res.headersSent && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || error.response?.status >= 500 || shouldRetryForNetwork) && retryCount < maxRetries - 1) {
@@ -2187,36 +2036,21 @@ app.post('/v1/messages', async (req, res) => {
         }
         retryCount++;
         
-        // Determine wait time: use rate limit reset time from headers if available
-        let waitMs = retryDelayMs;
-        let waitReason = 'exponential backoff';
-        
-        // Cap wait time at remaining timeout budget so total elapsed time
-        // never exceeds TOTAL_REQUEST_TIMEOUT_MS (prevents 524 errors)
+        // Determine wait time using shared helper (caps at remaining budget)
         const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
+        const { waitMs, waitReason, shouldAbort } = calculateRetryDelay({
+          error, isRateLimit, retryCount, keyManager, remainingMs, retryDelayMs
+        });
         
-        if (isRateLimit && error.response?.headers) {
-          const resetDate = keyManager.parseRateLimitReset(error.response.headers);
-          const resetWaitMs = resetDate.getTime() - Date.now();
-          if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
-            waitMs = Math.max(retryDelayMs, resetWaitMs);
-            waitReason = 'rate limit reset time';
-          }
-        }
-        
-        if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          if (error.minWaitMs > remainingMs) {
-            waitMs = 0;
-            waitReason = 'key reset exceeds budget';
-          } else {
-            waitMs = error.minWaitMs;
-            waitReason = 'key reset time';
-          }
+        if (shouldAbort) {
+          return res.status(504).json(normalizeErrorResponse(
+            'Request timeout: total processing time exceeded limit',
+            504
+          ));
         }
         
         if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
-          const msg = `[Retry] Error on Anthropic: ${error.message || error.code}, waiting ${waitMs}ms before retry (attempt ${retryCount}/${maxRetries}, ${waitReason})...`;
-          logInfo(msg, { context: 'Anthropic Retry', retryCount, delayMs: waitMs, waitReason, errorCode: error.code });
+          logRetry('anthropic', { retryCount, maxRetries, waitMs, waitReason, errorCode: error.code, errorMessage });
           await new Promise(resolve => setTimeout(resolve, waitMs));
         }
         continue;
