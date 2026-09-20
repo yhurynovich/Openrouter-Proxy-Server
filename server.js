@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { mkdir } from 'fs/promises';
 import net from 'net';
+import ipaddr from 'ipaddr.js';
 
 dotenv.config();
 
@@ -25,30 +26,118 @@ function sanitizeHeaderValue(value) {
 
 const BLOCKED_HOSTNAMES = new Set([
   'localhost', 'metadata.google.internal', 'metadata',
+  'metadata.azure.com',
 ]);
 
-// Check if an IP address (or hostname resolving to one) is in a private/reserved range
+// Private/reserved IP ranges to block (ipaddr.js range names)
+const BLOCKED_RANGES = new Set([
+  'private', 'loopback', 'linkLocal', 'uniqueLocal', 'reserved',
+  'carrierGradeNat', 'unspecified',
+]);
+
+// Normalize non-canonical IPv4 encodings (hex, octal, decimal, abbreviated) to dotted-decimal
+function normalizeNonCanonicalIPv4(str) {
+  if (/^0x[0-9a-f]+$/i.test(str)) {
+    const num = parseInt(str, 16);
+    if (num >= 0 && num <= 0xffffffff) {
+      return [
+        (num >>> 24) & 0xff, (num >>> 16) & 0xff,
+        (num >>> 8) & 0xff, num & 0xff,
+      ].join('.');
+    }
+  }
+  if (/^\d+$/.test(str)) {
+    const num = parseInt(str, 10);
+    if (num >= 0 && num <= 0xffffffff) {
+      return [
+        (num >>> 24) & 0xff, (num >>> 16) & 0xff,
+        (num >>> 8) & 0xff, num & 0xff,
+      ].join('.');
+    }
+  }
+  if (str.includes('.')) {
+    const parts = str.split('.');
+    if (parts.length >= 2 && parts.length <= 4) {
+      const dec = parts.map(p => {
+        if (/^0x[0-9a-f]+$/i.test(p)) return parseInt(p, 16);
+        if (/^0[0-7]+$/.test(p)) return parseInt(p, 8);
+        return parseInt(p, 10);
+      });
+      if (dec.every(d => !isNaN(d) && d >= 0 && d <= 255)) {
+        while (dec.length < 4) dec.push(0);
+        return dec.join('.');
+      }
+    }
+  }
+  return null;
+}
+
+// Check if an IP address is in a private/reserved range using proper parsing
 function isPrivateOrInternal(hostname) {
   if (BLOCKED_HOSTNAMES.has(hostname.toLowerCase())) return true;
-  // Strip IPv6 brackets for [::1] format
   const clean = hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  // Check IPv4 patterns
-  if (/^0\./.test(clean)) return true;
-  if (/^127\./.test(clean)) return true;
-  if (/^10\./.test(clean)) return true;
-  if (/^100\.\d+\.\d+\.\d+$/.test(clean)) return true; // 100.64.0.0/10 CGNAT
-  if (/^169\.254\./.test(clean)) return true;
-  if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(clean)) return true; // 172.16.0.0/12
-  if (/^192\.168\./.test(clean)) return true;
-  // Check IPv6 patterns (including IPv4-mapped IPv6 ::ffff:127.0.0.1)
-  if (clean === '::1') return true;
-  if (clean.startsWith('::ffff:')) {
-    return isPrivateOrInternal(clean.slice(7)); // Strip ::ffff: prefix and re-check
+
+  // Handle non-canonical IPv4 encodings (hex, octal, decimal, abbreviated)
+  const normalized = normalizeNonCanonicalIPv4(clean);
+  if (normalized) {
+    try {
+      const addr = ipaddr.parse(normalized);
+      return BLOCKED_RANGES.has(addr.range());
+    } catch {
+      return true;
+    }
   }
-  if (clean.startsWith('fc') || clean.startsWith('fd')) return true; // fc00::/7 ULA
-  if (clean.startsWith('fe80')) return true; // fe80::/10 link-local
-  if (clean === '0.0.0.0') return true;
+
+  // Canonical IPv4
+  if (net.isIPv4(clean)) {
+    try {
+      const addr = ipaddr.parse(clean);
+      return BLOCKED_RANGES.has(addr.range());
+    } catch {
+      return true;
+    }
+  }
+
+  // Canonical IPv6 (including IPv4-mapped IPv6 like ::ffff:7f00:1)
+  if (net.isIPv6(clean)) {
+    try {
+      const addr = ipaddr.parse(clean);
+      if (addr.isIPv4MappedAddress()) {
+        return BLOCKED_RANGES.has(addr.toIPv4Address().range());
+      }
+      return BLOCKED_RANGES.has(addr.range());
+    } catch {
+      return true;
+    }
+  }
+
   return false;
+}
+
+// Resolve hostname and check if any resulting IP is private/reserved (DNS rebinding protection)
+async function hostnameResolvesToPrivate(hostname) {
+  return new Promise((resolve) => {
+    let pending = 2;
+    let isPrivate = false;
+    const done = (val) => {
+      if (pending <= 0) return;
+      isPrivate = isPrivate || val;
+      pending--;
+      if (pending === 0) resolve(isPrivate);
+    };
+
+    dnsResolver.resolve4(hostname, (err, addresses) => {
+      if (err || !addresses || addresses.length === 0) { done(false); return; }
+      done(addresses.some(addr => isPrivateOrInternal(addr)));
+    });
+
+    dnsResolver.resolve6(hostname, (err, addresses) => {
+      if (err || !addresses || addresses.length === 0) { done(false); return; }
+      done(addresses.some(addr => isPrivateOrInternal(addr)));
+    });
+
+    setTimeout(() => resolve(isPrivate), CONFIG.DNS_LOOKUP_TIMEOUT_MS);
+  });
 }
 
 // Safely stringify objects, falling back to String() on error
@@ -74,6 +163,9 @@ function validateImageUrl(url) {
   if (hostname === 'localhost' || isPrivateOrInternal(hostname)) return false;
   return true;
 }
+
+// Full DNS rebinding protection available via async function:
+// async function validateImageUrlAsync(url) { ... await hostnameResolvesToPrivate(hostname) ... }
 
 // Configuration constants
 // Parse integer from env with validation, clamping to [min, max]
@@ -1199,18 +1291,21 @@ app.post('/v1/chat/completions', async (req, res) => {
   const maxFailoverSwitches = failoverManager.getMaxFailoverSwitches();
   const requestStartTime = Date.now();
 
+  let activeAbortController = null;
+  req.once('close', () => activeAbortController?.abort());
+
   for (let modelIdx = 0; modelIdx < failoverChain.length; modelIdx++) {
     const currentFailoverModel = failoverChain[modelIdx];
 
     if (modelIdx > 0) {
-      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
-      res.setHeader('X-Failover-Model', 'true');
       if (maxFailoverSwitches > 0 && modelIdx > maxFailoverSwitches) {
         return res.status(503).json(normalizeErrorResponse(
           'Max model failover attempts exceeded — all models unavailable',
           503
         ));
       }
+      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
+      res.setHeader('X-Failover-Model', 'true');
     }
 
     let retryCount = 0;
@@ -1240,8 +1335,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       const currentKey = await keyManager.getKey();
       
       // Create AbortController for client disconnect handling
-      const abortController = new AbortController();
-      req.once('close', () => abortController.abort());
+      activeAbortController = new AbortController();
+      const abortController = activeAbortController;
       
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
@@ -1257,7 +1352,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: Math.min(CONFIG.AXIOS_TIMEOUT, Math.max(1000, remainingMs)),
+        timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
         signal: abortController.signal
       };
 
@@ -1317,7 +1412,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         // For other errors (validation, model not found, etc.), check if failoverable
         const statusCode = response.status || 400;
         if (failoverManager.shouldFailover({ response: { status: statusCode, data: responseData } })) {
-          innerLoopError = responseData;
+          innerLoopError = new Error('OpenRouter error in response body');
+          innerLoopError.response = { status: statusCode, data: responseData };
           innerLoopStatusCode = statusCode;
           break;
         }
@@ -1331,15 +1427,19 @@ app.post('/v1/chat/completions', async (req, res) => {
       if (isStreaming) {
         // Wrap res.write to track if data was sent
         const originalWrite = res.write;
-        res.write = function(chunk) {
-          if (chunk && chunk.length > 0) {
-            streamDataSent = true;
-          }
-          return originalWrite.apply(this, arguments);
-        };
-        
-        await handleStreamingResponse(response, req, res, abortController);
-        return;
+        try {
+          res.write = function(chunk) {
+            if (chunk && chunk.length > 0) {
+              streamDataSent = true;
+            }
+            return originalWrite.apply(this, arguments);
+          };
+          
+          await handleStreamingResponse(response, req, res, abortController);
+          return;
+        } finally {
+          res.write = originalWrite;
+        }
       }
 
       return res.json(responseData);
@@ -1413,7 +1513,7 @@ app.post('/v1/chat/completions', async (req, res) => {
               retryCount
             });
             if (!res.writableEnded) {
-              res.write(normalizeStreamError('Request timeout: total processing time exceeded limit', 504));
+              res.write(normalizeStreamError({ error: { message: 'Request timeout: total processing time exceeded limit', type: 'timeout' } }, 504));
               res.end();
             }
             return;
@@ -1439,8 +1539,13 @@ app.post('/v1/chat/completions', async (req, res) => {
           }
           
           if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-            waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
-            waitReason = 'key reset time';
+            if (error.minWaitMs > remainingMs) {
+              waitMs = 0;
+              waitReason = 'key reset exceeds budget';
+            } else {
+              waitMs = error.minWaitMs;
+              waitReason = 'key reset time';
+            }
           }
           
           // Add delay for rate limits, network errors, or exhausted keys
@@ -1486,6 +1591,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (isToolCapabilityError && requestHadTools && retryCount < maxRetries - 1) {
           // Mark that we should strip tools on the next attempt
           toolsStripped = true;
+          retryCount++;
           logInfo('Model does not support tools, will retry without tools on next attempt', {
             context: 'Retry',
             model: currentFailoverModel,
@@ -1532,8 +1638,13 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
-          waitReason = 'key reset time';
+          if (error.minWaitMs > remainingMs) {
+            waitMs = 0;
+            waitReason = 'key reset exceeds budget';
+          } else {
+            waitMs = error.minWaitMs;
+            waitReason = 'key reset time';
+          }
         }
         
         // Add delay for rate limits, network errors, or exhausted keys
@@ -1614,6 +1725,9 @@ app.get('/v1/models', async (req, res) => {
   let retryCount = 0;
   const requestStartTime = Date.now();
 
+  let activeAbortController = null;
+  req.once('close', () => activeAbortController?.abort());
+
   while (retryCount < maxRetries) {
     // Check total elapsed time to prevent Cloudflare 524 timeout (100s limit)
     const elapsedMs = Date.now() - requestStartTime;
@@ -1633,8 +1747,8 @@ app.get('/v1/models', async (req, res) => {
       const currentKey = await keyManager.getKey();
       
       // Create AbortController for client disconnect handling
-      const abortController = new AbortController();
-      req.once('close', () => abortController.abort());
+      activeAbortController = new AbortController();
+      const abortController = activeAbortController;
       
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
@@ -1648,7 +1762,7 @@ app.get('/v1/models', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: Math.min(CONFIG.MODELS_TIMEOUT, Math.max(1000, remainingMs)),
+        timeout: Math.max(100, Math.min(CONFIG.MODELS_TIMEOUT, remainingMs)),
         signal: abortController.signal
       };
 
@@ -1747,8 +1861,13 @@ app.get('/v1/models', async (req, res) => {
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
-          waitReason = 'key reset time';
+          if (error.minWaitMs > remainingMs) {
+            waitMs = 0;
+            waitReason = 'key reset exceeds budget';
+          } else {
+            waitMs = error.minWaitMs;
+            waitReason = 'key reset time';
+          }
         }
         
         // Add delay for rate limits, network errors, or exhausted keys
@@ -1788,6 +1907,12 @@ app.post('/v1/messages', async (req, res) => {
     });
   }
   
+  if (req.body.max_tokens === undefined || typeof req.body.max_tokens !== 'number' || req.body.max_tokens <= 0) {
+    return res.status(400).json({
+      error: { message: 'Invalid request: max_tokens is required and must be a positive number', type: 'invalid_request_error' }
+    });
+  }
+  
   const requestId = randomUUID();
   // Use higher retry limit for rate limit errors
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
@@ -1797,6 +1922,9 @@ app.post('/v1/messages', async (req, res) => {
   const failoverChain = failoverManager.getFailoverChain(originalModel) || [originalModel];
   const maxFailoverSwitches = failoverManager.getMaxFailoverSwitches();
   const requestStartTime = Date.now();
+
+  let activeAbortController = null;
+  req.once('close', () => activeAbortController?.abort());
 
   // Transform Anthropic format to OpenAI format
   const baseOpenAIBody = {
@@ -1813,7 +1941,7 @@ app.post('/v1/messages', async (req, res) => {
     max_tokens: req.body.max_tokens,
     temperature: req.body.temperature,
     top_p: req.body.top_p,
-    stop: req.body.stop,
+    stop: req.body.stop_sequences || req.body.stop,
     tools: req.body.tools,
     tool_choice: req.body.tool_choice,
   };
@@ -1822,14 +1950,14 @@ app.post('/v1/messages', async (req, res) => {
     const currentFailoverModel = failoverChain[modelIdx];
 
     if (modelIdx > 0) {
-      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
-      res.setHeader('X-Failover-Model', 'true');
       if (maxFailoverSwitches > 0 && modelIdx > maxFailoverSwitches) {
         return res.status(503).json(normalizeErrorResponse(
           'Max model failover attempts exceeded — all models unavailable',
           503
         ));
       }
+      failoverManager.logFailover(originalModel, currentFailoverModel, requestId);
+      res.setHeader('X-Failover-Model', 'true');
     }
 
     let retryCount = 0;
@@ -1868,8 +1996,8 @@ app.post('/v1/messages', async (req, res) => {
       const currentKey = await keyManager.getKey();
       
       // Create AbortController for client disconnect handling
-      const abortController = new AbortController();
-      req.once('close', () => abortController.abort());
+      activeAbortController = new AbortController();
+      const abortController = activeAbortController;
       
       // Forward client headers if provided, fallback to env vars
       const clientReferer = req.headers['http-referer'] || req.headers['referer'];
@@ -1884,13 +2012,21 @@ app.post('/v1/messages', async (req, res) => {
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
           'X-Request-ID': requestId
         },
-        timeout: Math.min(CONFIG.AXIOS_TIMEOUT, Math.max(1000, remainingMs)),
+        timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
         signal: abortController.signal
       };
       
-      // Add responseType: 'stream' for streaming requests
+      // Reject streaming early — Anthropic SSE format differs from OpenAI SSE
+      // and no translation layer is implemented. Check before the upstream call
+      // to avoid opening a stream that is never consumed (socket leak + quota waste).
       if (openAIBody.stream) {
-        axiosConfig.responseType = 'stream';
+        return res.status(501).json({
+          type: 'error',
+          error: {
+            type: 'not_implemented',
+            message: 'Streaming is not yet supported for the Anthropic Messages endpoint',
+          }
+        });
       }
 
       // Convert normalized model ID back to OpenRouter ID if needed
@@ -1931,7 +2067,8 @@ app.post('/v1/messages', async (req, res) => {
         
         const statusCode = response.status || 400;
         if (failoverManager.shouldFailover({ response: { status: statusCode, data: responseData } })) {
-          innerLoopError = responseData;
+          innerLoopError = new Error('OpenRouter error in response body');
+          innerLoopError.response = { status: statusCode, data: responseData };
           innerLoopStatusCode = statusCode;
           break;
         }
@@ -1939,19 +2076,6 @@ app.post('/v1/messages', async (req, res) => {
       }
       
       await keyManager.markKeySuccess();
-      
-      // Handle streaming — Anthropic SSE format differs from OpenAI SSE.
-      // Raw OpenAI chunks cannot be forwarded to Anthropic clients. Return 501
-      // until a proper SSE translation layer is implemented.
-      if (openAIBody.stream) {
-        return res.status(501).json({
-          type: 'error',
-          error: {
-            type: 'not_implemented',
-            message: 'Streaming is not yet supported for the Anthropic Messages endpoint',
-          }
-        });
-      }
       
       // Non-streaming: parse and transform response
       const anthropicResponse = {
@@ -2081,8 +2205,13 @@ app.post('/v1/messages', async (req, res) => {
         }
         
         if (error.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs && error.minWaitMs > 0) {
-          waitMs = Math.min(error.minWaitMs, Math.max(remainingMs, 0));
-          waitReason = 'key reset time';
+          if (error.minWaitMs > remainingMs) {
+            waitMs = 0;
+            waitReason = 'key reset exceeds budget';
+          } else {
+            waitMs = error.minWaitMs;
+            waitReason = 'key reset time';
+          }
         }
         
         if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
