@@ -262,6 +262,12 @@ let modelIdMapping = new Map();
 let modelIdMappingLoaded = false;
 let modelIdMappingPromise = null;
 
+// Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
+// IMPORTANT: When multiple OpenRouter IDs normalize to the same ID (e.g., both
+// "provider/model" and "provider/model:free" normalize to "model"), the reverse
+// mapping MUST prefer the :free variant so that requests for free models continue
+// to use the free tier. This is enforced in buildModelIdMapping() collision handling.
+
 // Known fallback mappings for edge cases (models that don't follow provider/model pattern)
 const FALLBACK_MODEL_MAPPING = Object.create(null);
 Object.assign(FALLBACK_MODEL_MAPPING, {
@@ -302,6 +308,7 @@ function buildModelIdMapping(models) {
   REVERSE_MODEL_MAPPING.clear();
   // Re-populate from fallback mappings (fallback takes priority)
   for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
+    mapping.set(openRouterId, normalizedId);
     REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
   }
   
@@ -334,15 +341,29 @@ function buildModelIdMapping(models) {
     
     if (normalizedId) {
       mapping.set(openRouterId, normalizedId);
-      // Build reverse mapping (normalized -> OpenRouter) — clear first to prevent stale entries
-      // Only set if not already set (fallback takes priority), warn on collision
+      // Build reverse mapping (normalized -> OpenRouter)
+      // Prefer :free variants when available, otherwise first entry wins
       if (REVERSE_MODEL_MAPPING.has(normalizedId)) {
-        logInfo('Model ID collision in reverse mapping', {
-          context: 'ModelMapping',
-          normalizedId,
-          existing: REVERSE_MODEL_MAPPING.get(normalizedId),
-          new: openRouterId
-        });
+        const existing = REVERSE_MODEL_MAPPING.get(normalizedId);
+        // Prefer free variant: if new is free and existing is not, replace
+        const isNewFree = openRouterId.endsWith(':free');
+        const isExistingFree = existing.endsWith(':free');
+        if (isNewFree && !isExistingFree) {
+          REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
+          logInfo('Model ID collision: preferring free variant', {
+            context: 'ModelMapping',
+            normalizedId,
+            previous: existing,
+            selected: openRouterId
+          });
+        } else {
+          logInfo('Model ID collision in reverse mapping (keeping existing)', {
+            context: 'ModelMapping',
+            normalizedId,
+            existing,
+            new: openRouterId
+          });
+        }
       } else {
         REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
       }
