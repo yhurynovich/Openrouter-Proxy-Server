@@ -263,7 +263,6 @@ let modelIdMappingLoaded = false;
 let modelIdMappingPromise = null;
 
 // Known fallback mappings for edge cases (models that don't follow provider/model pattern)
-// Use Object.create(null) to prevent prototype pollution via __proto__/constructor keys
 const FALLBACK_MODEL_MAPPING = Object.create(null);
 Object.assign(FALLBACK_MODEL_MAPPING, {
   // Free models with :free suffix
@@ -283,6 +282,7 @@ Object.assign(FALLBACK_MODEL_MAPPING, {
   'cognitivecomputations/dolphin-2.9.2-qwen2-7b:free': 'dolphin-2.9.2-qwen2-7b',
   'sao10k/l3-70b-euryale-v2.1:free': 'l3-70b-euryale-v2.1',
   'liquid/lfm-40b:free': 'lfm-40b',
+  'poolside/laguna-xs-2.1:free': 'laguna-xs-2.1',
 });
 
 // Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
@@ -1387,8 +1387,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         delete requestBody.tool_choice;
       }
       requestBody.model = currentFailoverModel;
-      if (requestBody.model && REVERSE_MODEL_MAPPING.has(requestBody.model)) {
-        requestBody.model = REVERSE_MODEL_MAPPING.get(requestBody.model);
+      // Normalize the model ID first (strip provider prefix and :free suffix)
+      // so we can look it up in REVERSE_MODEL_MAPPING which uses normalized keys
+      const normalizedModel = normalizeModelId(currentFailoverModel);
+      if (normalizedModel && REVERSE_MODEL_MAPPING.has(normalizedModel)) {
+        requestBody.model = REVERSE_MODEL_MAPPING.get(normalizedModel);
       }
 
       const response = await axiosInstance.post(
@@ -1929,8 +1932,11 @@ app.post('/v1/messages', async (req, res) => {
       }
 
       // Convert normalized model ID back to OpenRouter ID if needed
-      if (openAIBody.model && REVERSE_MODEL_MAPPING.has(openAIBody.model)) {
-        openAIBody.model = REVERSE_MODEL_MAPPING.get(openAIBody.model);
+      // Normalize the model ID first (strip provider prefix and :free suffix)
+      // so we can look it up in REVERSE_MODEL_MAPPING which uses normalized keys
+      const normalizedModel = normalizeModelId(openAIBody.model);
+      if (normalizedModel && REVERSE_MODEL_MAPPING.has(normalizedModel)) {
+        openAIBody.model = REVERSE_MODEL_MAPPING.get(normalizedModel);
       }
       
       const response = await axiosInstance.post(
