@@ -73,6 +73,13 @@ function createAbortSignal(abortController, remainingMs) {
     return c.signal;
   }
 
+  // If the client already disconnected, short-circuit: an already-aborted
+  // signal never fires 'abort' listeners, so without this check axios would
+  // issue an upstream request for a dead client.
+  if (abortController?.signal?.aborted) {
+    return abortController.signal;
+  }
+
   const budgetMs = Math.max(1, Math.min(remainingMs, MAX_TIMEOUT_MS));
 
   // Modern path: both available (Node >= 18.17)
@@ -82,26 +89,34 @@ function createAbortSignal(abortController, remainingMs) {
   }
 
   // Fallback: manual merge via addEventListener + setTimeout (Node < 18.17).
-  // { once: true } auto-removes listeners; timer.unref() lets process exit.
   const controller = new AbortController();
-  let timeoutSignal = null;
+  let cleanupTimer = null;
 
   const onAbort = () => {
     const reason = abortController.signal.aborted
       ? abortController.signal.reason || new Error('Client disconnected')
       : new Error('Request timeout');
+    // Clear the fallback timer so it doesn't fire after the signal is already
+    // settled (prevents resource leak on early abort).
+    if (cleanupTimer) {
+      clearTimeout(cleanupTimer);
+      cleanupTimer = null;
+    }
     controller.abort(reason);
   };
 
   abortController.signal.addEventListener('abort', onAbort, { once: true });
 
   if (typeof AbortSignal.timeout === 'function') {
-    timeoutSignal = AbortSignal.timeout(budgetMs);
+    const timeoutSignal = AbortSignal.timeout(budgetMs);
     timeoutSignal.addEventListener('abort', onAbort, { once: true });
   } else {
-    const timer = setTimeout(() => controller.abort(new Error('Request timeout')), budgetMs);
-    if (typeof timer.unref === 'function') {
-      timer.unref();
+    cleanupTimer = setTimeout(() => {
+      cleanupTimer = null;
+      controller.abort(new Error('Request timeout'));
+    }, budgetMs);
+    if (typeof cleanupTimer.unref === 'function') {
+      cleanupTimer.unref();
     }
   }
 
@@ -200,12 +215,22 @@ function calculateRetryDelay({ error, isRateLimit, keyManager, remainingMs, retr
   const candidates = [];
 
   // 1. Upstream rate-limit reset header (when it fits within budget)
+  let rateLimitHandled = false;
   if (isRateLimit && error?.response?.headers) {
     try {
       const resetDate = keyManager.parseRateLimitReset(error.response.headers);
       const resetWaitMs = resetDate.getTime() - Date.now();
-      if (resetWaitMs > 0 && resetWaitMs <= remainingMs) {
-        candidates.push({ ms: resetWaitMs, reason: 'rate limit reset time' });
+      if (resetWaitMs > remainingMs) {
+        // Reset time exceeds our remaining budget - abort rather than hammering
+        // the key before its reset (wastes retries and budget)
+        return { waitMs: 0, waitReason: 'rate limit exceeds budget', shouldAbort: true };
+      }
+      if (resetWaitMs > 0) {
+        // Honor the reset time with a floor at the base backoff to avoid
+        // hammering too fast on very short resets
+        waitMs = Math.max(retryDelayMs, resetWaitMs);
+        waitReason = 'rate limit reset time';
+        rateLimitHandled = true;
       }
     } catch {
       // parseRateLimitReset can throw on unexpected header formats; fall back to exponential backoff
@@ -213,15 +238,22 @@ function calculateRetryDelay({ error, isRateLimit, keyManager, remainingMs, retr
   }
 
   // 2. NO_AVAILABLE_KEYS carries its own authoritative minWaitMs
-  if (error?.code === 'NO_AVAILABLE_KEYS' && error.minWaitMs != null) {
-    if (error.minWaitMs > remainingMs) {
-      return { waitMs: 0, waitReason: 'key reset exceeds budget', shouldAbort: true };
+  if (error?.code === 'NO_AVAILABLE_KEYS') {
+    if (error.minWaitMs != null) {
+      if (error.minWaitMs > remainingMs) {
+        return { waitMs: 0, waitReason: 'key reset exceeds budget', shouldAbort: true };
+      }
+      candidates.push({ ms: error.minWaitMs, reason: 'key reset time' });
+    } else {
+      // minWaitMs == null means no key has a future rate limit reset - retrying would
+      // cause write-amplification loop as reactivateAllKeys re-saves the entire file
+      // on each attempt. Treat as fatal for this request.
+      return { waitMs: 0, waitReason: 'no available keys fatal', shouldAbort: true };
     }
-    candidates.push({ ms: error.minWaitMs, reason: 'key reset time' });
   }
 
   // Pick the minimum candidate that is positive and fits within budget
-  if (candidates.length > 0) {
+  if (!rateLimitHandled && candidates.length > 0) {
     const valid = candidates.filter((c) => c.ms > 0 && c.ms <= remainingMs);
     if (valid.length > 0) {
       valid.sort((a, b) => a.ms - b.ms);

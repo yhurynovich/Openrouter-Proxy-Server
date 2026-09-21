@@ -5,14 +5,12 @@ import { fileURLToPath } from 'url';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const KEYS_FILE = join(__dirname, '../data/keys.json');
 
-// File lock mutex with timeout to prevent hang on process crash
+// File lock mutex (resolve-only) - await previous write, no timeout race
 let writeLock = Promise.resolve();
-const WRITE_LOCK_TIMEOUT = 30000; // 30 seconds
 
 async function withWriteLock(fn) {
   const prev = writeLock;
   let release;
-  let timeoutId;
 
   // Lock promise is resolve-only (never reject) so it cannot become
   // permanently rejected and break future callers.
@@ -23,25 +21,10 @@ async function withWriteLock(fn) {
   writeLock = lockPromise;
 
   try {
-    // Race the previous lock against a timeout watchdog.
-    // If the watchdog fires, the timeout error propagates to the caller,
-    // but the lock promise itself stays resolved (see finally).
-    await Promise.race([
-      prev,
-      new Promise((_, reject) => {
-        timeoutId = setTimeout(() => {
-          reject(new Error('Write lock timeout - possible deadlock'));
-        }, WRITE_LOCK_TIMEOUT);
-      }),
-    ]);
-
+    // Wait for previous write to complete, then execute this write.
+    await prev;
     return await fn();
-  } catch (error) {
-    // On timeout, reset writeLock so future callers aren't permanently blocked.
-    writeLock = Promise.resolve();
-    throw error;
   } finally {
-    clearTimeout(timeoutId);
     release();
   }
 }
@@ -133,6 +116,17 @@ class ApiKey {
     const tmpFile = KEYS_FILE + '.tmp';
     await fs.writeFile(tmpFile, JSON.stringify(keys, null, 2));
     await fs.rename(tmpFile, KEYS_FILE); // atomic on POSIX
+  }
+
+  /**
+   * Bulk write keys array to storage (for batch operations like reactivateAllKeys)
+   * Goes through write lock to avoid racing with concurrent saves.
+   * @param {ApiKey[]} keys - Array of key instances to write
+   */
+  static async bulkWrite(keys) {
+    return withWriteLock(async () => {
+      await this.#writeKeys(keys);
+    });
   }
 }
 

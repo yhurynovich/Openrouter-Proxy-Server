@@ -5,6 +5,7 @@ const KEY_MANAGER_CONFIG = {
   MAX_ROTATION_DEPTH: parseInt(process.env.KEY_MAX_ROTATION_DEPTH || '3', 10),
   MAX_FAILURE_COUNT: parseInt(process.env.KEY_MAX_FAILURE_COUNT || '5', 10),
   REACTIVATION_FAILURE_REDUCTION: parseInt(process.env.KEY_REACTIVATION_FAILURE_REDUCTION || '2', 10),
+  ROTATE_KEY_TIMEOUT_MS: parseInt(process.env.KEY_ROTATE_TIMEOUT_MS || '30000', 10),
   // Rate limit header parsing thresholds
   UNIX_TIMESTAMP_THRESHOLD: 1e9,        // Unix timestamp in seconds (before year 2001)
   MILLISECOND_THRESHOLD: 1e12,          // Milliseconds since epoch (year ~2001+)
@@ -68,12 +69,25 @@ class KeyManager {
       return this.#rotationPromise;
     }
 
-    this.#rotationPromise = this.#doRotateKey(depth);
-    
+    const p = this.#doRotateKey(depth);
+    this.#rotationPromise = p;
+
     try {
-      return await this.#rotationPromise;
+      // Overall timeout — prevent rotateKey from hanging indefinitely if
+      // upstream key store or DNS is stuck. Callers awaiting the rotation
+      // promise won't block forever.
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`rotateKey timed out after ${KEY_MANAGER_CONFIG.ROTATE_KEY_TIMEOUT_MS}ms`));
+        }, KEY_MANAGER_CONFIG.ROTATE_KEY_TIMEOUT_MS);
+      });
+      return await Promise.race([p, timeoutPromise]);
     } finally {
-      this.#rotationPromise = null;
+      // Only clear if still pointing at us — a concurrent caller may have
+      // installed a newer rotation promise while we awaited.
+      if (this.#rotationPromise === p) {
+        this.#rotationPromise = null;
+      }
     }
   }
 
@@ -101,9 +115,10 @@ class KeyManager {
         // No keys available - attempt to reactivate all keys first
         const reactivated = await this.reactivateAllKeys();
         if (reactivated) {
-          // Clear rotation promise before recursive call to avoid deadlock
-          this.#rotationPromise = null;
-          return await this.rotateKey(depth + 1);
+          // Recurse directly into #doRotateKey (not rotateKey) so the
+          // rotation mutex stays held — prevents concurrent rotations from
+          // racing on key selection.
+          return await this.#doRotateKey(depth + 1);
         }
         
         // No keys available even after reactivation - calculate estimated wait time
@@ -328,6 +343,11 @@ class KeyManager {
    * @returns {Date} Reset date
    */
   parseRateLimitReset(headers) {
+    // Handle null/undefined headers (e.g., when originalError.response?.headers is undefined)
+    if (!headers) {
+      headers = {};
+    }
+    
     // Check multiple possible header names (case-insensitive)
     const headerNames = [
       'ratelimit-reset',
@@ -342,7 +362,7 @@ class KeyManager {
     for (const name of headerNames) {
       // Headers in axios are lowercased
       const lowerName = name.toLowerCase();
-      if (headers[lowerName]) {
+      if (headers && headers[lowerName]) {
         resetTime = headers[lowerName];
         break;
       }
@@ -430,10 +450,12 @@ class KeyManager {
           isNvidia: isRateLimitError && originalError.message?.includes?.('Nvidia') || false
         });
 
-        // Persist rate-limit state, but always clear currentKey so the
-        // caller is forced to rotate — even if save() fails.
+        // Persist rate-limit state. If save fails, keep currentKey (with in-memory
+        // rateLimitResetAt) to prevent immediate re-selection and retry loops.
         try {
           await this.currentKey.save();
+          // Successfully persisted - safe to clear currentKey to force rotation
+          this.currentKey = null;
         } catch (saveError) {
           logError(saveError, {
             action: 'markKeyError save failed',
@@ -441,8 +463,10 @@ class KeyManager {
             originalErrorMessage: originalError?.message,
             originalStatusCode: originalError?.response?.status,
           });
+          // Save failed - keep currentKey with in-memory rateLimitResetAt to
+          // prevent immediate re-selection. The key won't be chosen again until
+          // its rateLimitResetAt expires (based on in-memory value).
         }
-        this.currentKey = null;
         return true; // Indicate it was a rate limit error
       }
 
@@ -540,13 +564,16 @@ class KeyManager {
   /**
    * Reactivate all inactive keys and clear rate limit cooldowns
    * Called when no keys are available to give them a second chance
+   * Bulk read-modify-write to avoid O(N²) I/O stalls
    * @returns {boolean} true if any keys were reactivated, false otherwise
    */
   async reactivateAllKeys() {
     try {
+      // Read all keys once
       const allKeys = await ApiKey.findAll({});
       let reactivated = 0;
       
+      // Modify all keys that need reactivation in memory
       for (const key of allKeys) {
         if (!key.isActive || key.rateLimitResetAt) {
           key.isActive = true;
@@ -554,12 +581,14 @@ class KeyManager {
           // This preserves some history of problematic keys
           key.failureCount = Math.max(0, key.failureCount - KEY_MANAGER_CONFIG.REACTIVATION_FAILURE_REDUCTION);
           key.rateLimitResetAt = null;
-          await key.save();
           reactivated++;
         }
       }
       
+      // If any keys were reactivated, write them all back in one operation
       if (reactivated > 0) {
+        await ApiKey.bulkWrite(allKeys);
+        
         logKeyEvent('Bulk Key Reactivation', {
           reactivatedCount: reactivated,
           totalKeys: allKeys.length
