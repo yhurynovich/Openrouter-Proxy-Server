@@ -217,6 +217,13 @@ const CONFIG = {
   // Model failover: JSON array of arrays defining interchangeable model groups
   // e.g. [["modelA","modelB","modelC"]] means modelA fails over to modelB, then modelC
   MODEL_FAILOVER_GROUPS: process.env.MODEL_FAILOVER_GROUPS || '',
+  // IDs advertised by GET /v1/models:
+  //   'full'       (default) -> exact OpenRouter IDs, e.g. "poolside/laguna-xs-2.1:free"
+  //   'normalized' (legacy)  -> provider prefix and ":free" stripped, e.g. "laguna-xs-2.1"
+  // Full IDs make the listing lossless: paid/free variants stay distinct and what a client
+  // picks from the list is exactly what gets sent upstream. Bare names sent by older
+  // clients are still resolved by toOpenRouterModelId().
+  MODEL_LIST_IDS: process.env.MODEL_LIST_IDS === 'normalized' ? 'normalized' : 'full',
   // Max model switches per request (0 = unlimited, try all models in the group)
   MAX_MODEL_FAILOVERS: parseIntEnv('MAX_MODEL_FAILOVERS', 0, 0, 100),
   MAX_MESSAGES: parseIntEnv('MAX_MESSAGES', 200, 1, 10000),
@@ -262,11 +269,13 @@ let modelIdMapping = new Map();
 let modelIdMappingLoaded = false;
 let modelIdMappingPromise = null;
 
-// Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
-// IMPORTANT: When multiple OpenRouter IDs normalize to the same ID (e.g., both
-// "provider/model" and "provider/model:free" normalize to "model"), the reverse
-// mapping MUST prefer the :free variant so that requests for free models continue
-// to use the free tier. This is enforced in buildModelIdMapping() collision handling.
+// Reverse mapping (normalized ID -> OpenRouter ID).
+// /v1/models advertises *normalized* IDs (provider prefix and ":free" stripped), so
+// clients may send those back. The reverse lookup is VARIANT-AWARE: free and paid IDs
+// live in separate maps, so they can never overwrite each other.
+//   1. A request that is already an exact OpenRouter ID is NEVER rewritten.
+//   2. An explicit ":free" request only resolves to a ":free" ID (never paid/bare).
+//   3. See toOpenRouterModelId() for the remaining (bare-name) rules.
 
 // Known fallback mappings for edge cases (models that don't follow provider/model pattern)
 const FALLBACK_MODEL_MAPPING = Object.create(null);
@@ -289,12 +298,80 @@ Object.assign(FALLBACK_MODEL_MAPPING, {
   'sao10k/l3-70b-euryale-v2.1:free': 'l3-70b-euryale-v2.1',
   'liquid/lfm-40b:free': 'lfm-40b',
   'poolside/laguna-xs-2.1:free': 'laguna-xs-2.1',
+  'poolside/laguna-s-2.1:free': 'laguna-s-2.1',
 });
 
-// Reverse mapping: normalized ID -> OpenRouter ID (built from FALLBACK_MODEL_MAPPING + dynamic)
-const REVERSE_MODEL_MAPPING = new Map();
-for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
-  REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
+// Reverse maps, split by variant so ":free" and paid IDs cannot collide.
+const REVERSE_FREE_MODEL_MAPPING = new Map(); // normalized name -> "provider/model:free"
+const REVERSE_PAID_MODEL_MAPPING = new Map(); // normalized name -> "provider/model" (non-free)
+const KNOWN_OPENROUTER_IDS = new Set();       // exact OpenRouter IDs (fallback + live list)
+
+// Split an ID into its bare model name and free flag: "a/b:free" -> { base: "b", isFree: true }
+function splitModelId(id) {
+  const lastSlash = id.lastIndexOf('/');
+  let base = lastSlash !== -1 ? id.slice(lastSlash + 1) : id;
+  const isFree = base.endsWith(':free');
+  if (isFree) base = base.slice(0, -':free'.length);
+  return { base, isFree };
+}
+
+function registerReverseMapping(openRouterId, normalizedId) {
+  const { base, isFree } = splitModelId(openRouterId);
+  const target = isFree ? REVERSE_FREE_MODEL_MAPPING : REVERSE_PAID_MODEL_MAPPING;
+  KNOWN_OPENROUTER_IDS.add(openRouterId);
+  for (const alias of new Set([normalizedId, base])) {
+    if (!alias) continue;
+    if (!target.has(alias)) {
+      target.set(alias, openRouterId);
+    } else if (target.get(alias) !== openRouterId) {
+      // Same variant, different provider (e.g. two providers ship "foo:free"): first wins
+      logInfo('Model ID collision in reverse mapping (keeping existing)', {
+        context: 'ModelMapping',
+        alias,
+        existing: target.get(alias),
+        new: openRouterId
+      });
+    }
+  }
+}
+
+function seedReverseMappingsFromFallback() {
+  KNOWN_OPENROUTER_IDS.clear();
+  REVERSE_FREE_MODEL_MAPPING.clear();
+  REVERSE_PAID_MODEL_MAPPING.clear();
+  for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
+    registerReverseMapping(openRouterId, normalizedId);
+  }
+}
+seedReverseMappingsFromFallback();
+
+/**
+ * Resolve the model ID a client sent to the exact ID OpenRouter expects.
+ *  1. Exact OpenRouter ID (e.g. "poolside/laguna-xs-2.1:free")  -> unchanged.
+ *  2. Explicit ":free" (any/unknown prefix, or bare)             -> the ":free" ID only.
+ *                                                                  Never downgraded to a paid/bare ID.
+ *  3. Qualified ("x/y", no ":free") but not an exact known ID    -> the paid ID only.
+ *  4. Bare name as advertised by /v1/models (suffix is hidden there) -> free first, then paid
+ *     (legacy behaviour; this is the only ambiguous case).
+ *  Anything unresolved is passed through untouched so OpenRouter returns its real error.
+ */
+function toOpenRouterModelId(model) {
+  if (!model || typeof model !== 'string') return model;
+  if (KNOWN_OPENROUTER_IDS.has(model)) return model;
+
+  const { base, isFree } = splitModelId(model);
+  let resolved;
+  if (isFree) {
+    resolved = REVERSE_FREE_MODEL_MAPPING.get(base);
+  } else if (model.includes('/')) {
+    resolved = REVERSE_PAID_MODEL_MAPPING.get(base);
+  } else {
+    resolved = REVERSE_FREE_MODEL_MAPPING.get(base) ?? REVERSE_PAID_MODEL_MAPPING.get(base);
+  }
+
+  if (!resolved || resolved === model) return model;
+  logInfo('Model ID resolved', { context: 'ModelMapping', requested: model, resolved });
+  return resolved;
 }
 
 /**
@@ -304,24 +381,22 @@ for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING
  */
 function buildModelIdMapping(models) {
   const mapping = new Map();
-  // Clear reverse mapping to prevent stale entries from previous fetches
-  REVERSE_MODEL_MAPPING.clear();
-  // Re-populate from fallback mappings (fallback takes priority)
+  // Rebuild reverse state from scratch to prevent stale entries from previous fetches
+  seedReverseMappingsFromFallback();
   for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
     mapping.set(openRouterId, normalizedId);
-    REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
   }
-  
+
   if (!Array.isArray(models)) {
     return mapping;
   }
-  
+
   for (const model of models) {
     if (!model || !model.id) continue;
-    
+
     const openRouterId = model.id;
     let normalizedId = null;
-    
+
     // Check fallback mappings first
     if (Object.prototype.hasOwnProperty.call(FALLBACK_MODEL_MAPPING, openRouterId)) {
       normalizedId = FALLBACK_MODEL_MAPPING[openRouterId];
@@ -338,38 +413,13 @@ function buildModelIdMapping(models) {
         normalizedId = openRouterId;
       }
     }
-    
+
     if (normalizedId) {
       mapping.set(openRouterId, normalizedId);
-      // Build reverse mapping (normalized -> OpenRouter)
-      // Prefer :free variants when available, otherwise first entry wins
-      if (REVERSE_MODEL_MAPPING.has(normalizedId)) {
-        const existing = REVERSE_MODEL_MAPPING.get(normalizedId);
-        // Prefer free variant: if new is free and existing is not, replace
-        const isNewFree = openRouterId.endsWith(':free');
-        const isExistingFree = existing.endsWith(':free');
-        if (isNewFree && !isExistingFree) {
-          REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
-          logInfo('Model ID collision: preferring free variant', {
-            context: 'ModelMapping',
-            normalizedId,
-            previous: existing,
-            selected: openRouterId
-          });
-        } else {
-          logInfo('Model ID collision in reverse mapping (keeping existing)', {
-            context: 'ModelMapping',
-            normalizedId,
-            existing,
-            new: openRouterId
-          });
-        }
-      } else {
-        REVERSE_MODEL_MAPPING.set(normalizedId, openRouterId);
-      }
+      registerReverseMapping(openRouterId, normalizedId);
     }
   }
-  
+
   return mapping;
 }
 
@@ -393,7 +443,7 @@ async function fetchAndBuildModelIdMapping() {
       // Use a temporary axios instance without auth for model fetching
       tempAxios = axios.create({
         timeout: 10000,
-        httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
+        httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10, lookup: customLookup }),
       });
 
       const response = await tempAxios.get('https://openrouter.ai/api/v1/models');
@@ -478,8 +528,8 @@ function normalizeModelObject(model) {
   
   const normalized = JSON.parse(JSON.stringify(model));
   
-  // Normalize ID
-  if (normalized.id) {
+  // Normalize ID (legacy mode only; default keeps the exact OpenRouter ID)
+  if (normalized.id && CONFIG.MODEL_LIST_IDS === 'normalized') {
     normalized.id = normalizeModelId(normalized.id);
   }
   
@@ -1407,13 +1457,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         delete requestBody.tools;
         delete requestBody.tool_choice;
       }
-      requestBody.model = currentFailoverModel;
-      // Normalize the model ID first (strip provider prefix and :free suffix)
-      // so we can look it up in REVERSE_MODEL_MAPPING which uses normalized keys
-      const normalizedModel = normalizeModelId(currentFailoverModel);
-      if (normalizedModel && REVERSE_MODEL_MAPPING.has(normalizedModel)) {
-        requestBody.model = REVERSE_MODEL_MAPPING.get(normalizedModel);
-      }
+      // Exact OpenRouter IDs pass through; advertised/normalized names are resolved (variant-aware)
+      requestBody.model = toOpenRouterModelId(currentFailoverModel);
 
       const response = await axiosInstance.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -1952,13 +1997,8 @@ app.post('/v1/messages', async (req, res) => {
         });
       }
 
-      // Convert normalized model ID back to OpenRouter ID if needed
-      // Normalize the model ID first (strip provider prefix and :free suffix)
-      // so we can look it up in REVERSE_MODEL_MAPPING which uses normalized keys
-      const normalizedModel = normalizeModelId(openAIBody.model);
-      if (normalizedModel && REVERSE_MODEL_MAPPING.has(normalizedModel)) {
-        openAIBody.model = REVERSE_MODEL_MAPPING.get(normalizedModel);
-      }
+      // Exact OpenRouter IDs pass through; advertised/normalized names are resolved (variant-aware)
+      openAIBody.model = toOpenRouterModelId(openAIBody.model);
       
       const response = await axiosInstance.post(
         'https://openrouter.ai/api/v1/chat/completions',
