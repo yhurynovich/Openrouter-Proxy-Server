@@ -13,21 +13,33 @@ async function withWriteLock(fn) {
   const prev = writeLock;
   let release;
   let timeoutId;
-  
-  // Create a new promise with timeout
-  const lockPromise = new Promise((resolve, reject) => {
+
+  // Lock promise is resolve-only (never reject) so it cannot become
+  // permanently rejected and break future callers.
+  const lockPromise = new Promise((resolve) => {
     release = resolve;
-    timeoutId = setTimeout(() => {
-      reject(new Error('Write lock timeout - possible deadlock'));
-    }, WRITE_LOCK_TIMEOUT);
   });
-  
+
   writeLock = lockPromise;
-  
+
   try {
-    await prev;
-    clearTimeout(timeoutId);
+    // Race the previous lock against a timeout watchdog.
+    // If the watchdog fires, the timeout error propagates to the caller,
+    // but the lock promise itself stays resolved (see finally).
+    await Promise.race([
+      prev,
+      new Promise((_, reject) => {
+        timeoutId = setTimeout(() => {
+          reject(new Error('Write lock timeout - possible deadlock'));
+        }, WRITE_LOCK_TIMEOUT);
+      }),
+    ]);
+
     return await fn();
+  } catch (error) {
+    // On timeout, reset writeLock so future callers aren't permanently blocked.
+    writeLock = Promise.resolve();
+    throw error;
   } finally {
     clearTimeout(timeoutId);
     release();

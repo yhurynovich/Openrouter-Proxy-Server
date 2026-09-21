@@ -165,7 +165,14 @@ class KeyManager {
           lastUsed: this.currentKey.lastUsed
         });
       } catch (error) {
-        logError(error, { action: 'markKeySuccess' });
+        // Do not rethrow: the upstream request already succeeded; a save
+        // failure only means lastUsed is stale, not that the key is bad.
+        // Log prominently so the operator knows key rotation state is stale.
+        logError(error, {
+          action: 'markKeySuccess',
+          keyId: this.currentKey?._id,
+          message: 'Failed to persist key success state — lastUsed may be stale',
+        });
       }
     }
   }
@@ -396,41 +403,51 @@ class KeyManager {
     return Math.floor(Math.max(baseDelay, cappedDelay + jitter));
   }
 
-  async markKeyError(error) {
+  async markKeyError(originalError) {
     if (!this.currentKey) return;
 
     try {
       // Check if it's a rate limit error (HTTP 429)
-      const isHttpRateLimit = error.response && error.response.status === 429;
-      
+      const isHttpRateLimit = originalError.response && originalError.response.status === 429;
+
       // Check for any rate limit error (NVIDIA, Xiaomi MiMo, generic, idle timeout)
-      const isRateLimitError = KeyManager.isRateLimitError(error);
-      
+      const isRateLimitError = KeyManager.isRateLimitError(originalError);
+
       const isRateLimit = isHttpRateLimit || isRateLimitError;
 
       if (isRateLimit) {
         // OpenRouter uses 'ratelimit-reset' header (lowercase, no x- prefix)
-        const resetDate = this.parseRateLimitReset(error.response?.headers);
+        const resetDate = this.parseRateLimitReset(originalError.response?.headers);
         logKeyEvent('Rate Limit Reset Parsed', {
           resetDateUtc: resetDate.toISOString(),
           resetDateLocal: resetDate.toString()
         });
         this.currentKey.rateLimitResetAt = resetDate;
-        
+
         logKeyEvent('Rate Limit Hit', {
           keyId: this.currentKey._id,
           resetTime: this.currentKey.rateLimitResetAt,
-          isNvidia: isRateLimitError && error.message?.includes?.('Nvidia') || false
+          isNvidia: isRateLimitError && originalError.message?.includes?.('Nvidia') || false
         });
 
-        await this.currentKey.save();
-        // Clear current key to force rotation
+        // Persist rate-limit state, but always clear currentKey so the
+        // caller is forced to rotate — even if save() fails.
+        try {
+          await this.currentKey.save();
+        } catch (saveError) {
+          logError(saveError, {
+            action: 'markKeyError save failed',
+            keyId: this.currentKey._id,
+            originalErrorMessage: originalError?.message,
+            originalStatusCode: originalError?.response?.status,
+          });
+        }
         this.currentKey = null;
         return true; // Indicate it was a rate limit error
       }
 
       this.currentKey.failureCount += 1;
-      
+
       // If too many failures, deactivate the key
       if (this.currentKey.failureCount >= KEY_MANAGER_CONFIG.MAX_FAILURE_COUNT) {
         this.currentKey.isActive = false;
@@ -450,12 +467,18 @@ class KeyManager {
       } else {
         await this.currentKey.save();
       }
-      
+
       return false; // Indicate it was not a rate limit error
-    } catch (error) {
-      logError(error, { 
+    } catch (saveError) {
+      // Log both the save/storage error and the original error context
+      // so neither is lost. Do NOT rethrow — callers expect a boolean
+      // return and rely on the original error (still in scope) for
+      // retry/failover decisions in the request handler.
+      logError(saveError, {
         action: 'markKeyError',
-        keyId: this.currentKey?._id
+        keyId: this.currentKey?._id,
+        originalErrorMessage: originalError?.message,
+        originalStatusCode: originalError?.response?.status,
       });
       return false;
     }
@@ -546,7 +569,9 @@ class KeyManager {
       return reactivated > 0;
     } catch (error) {
       logError(error, { action: 'reactivateAllKeys' });
-      return false;
+      // Re-throw so callers (#doRotateKey) can distinguish a genuine
+      // storage failure from "no keys were reactivatable".
+      throw error;
     }
   }
 }

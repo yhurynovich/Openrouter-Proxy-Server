@@ -367,15 +367,16 @@ async function fetchAndBuildModelIdMapping() {
   }
   
   modelIdMappingPromise = (async () => {
+    let tempAxios;
     try {
       // Use a temporary axios instance without auth for model fetching
-      const tempAxios = axios.create({
+      tempAxios = axios.create({
         timeout: 10000,
         httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 10 }),
       });
-      
+
       const response = await tempAxios.get('https://openrouter.ai/api/v1/models');
-      
+
       if (response.data && response.data.data) {
         modelIdMapping = buildModelIdMapping(response.data.data);
         modelIdMappingLoaded = true;
@@ -387,13 +388,23 @@ async function fetchAndBuildModelIdMapping() {
         throw new Error('Invalid model list response shape from OpenRouter');
       }
     } catch (error) {
-       logError(error, { context: 'ModelMapping fetch failed' });
-       // Reset state to allow future retries
-       modelIdMapping = new Map();
-       modelIdMappingLoaded = false;
-       modelIdMappingPromise = null;
-     }
-    
+      logError(error, { context: 'ModelMapping fetch failed' });
+      // Reset state to allow future retries
+      modelIdMapping = new Map();
+      modelIdMappingLoaded = false;
+      modelIdMappingPromise = null;
+      throw error;
+    } finally {
+      // Destroy the temporary agent to prevent socket/handle leaks
+      if (tempAxios?.defaults?.httpsAgent) {
+        try {
+          tempAxios.defaults.httpsAgent.destroy();
+        } catch {
+          // Agent may already be destroyed
+        }
+      }
+    }
+
     return modelIdMapping;
   })();
   
@@ -613,8 +624,10 @@ function sanitizeClientMessage(message, statusCode) {
   if (statusCode >= 500) {
     return 'Upstream service error';
   }
-  // Redact API key patterns (sk-or-..., sk-..., etc.) from 4xx messages
-  return message.replace(/sk-[a-zA-Z0-9_-]{10,}/g, 'sk-***REDACTED***');
+  // Coerce to string before redacting to avoid TypeError when upstream
+  // error messages are objects, numbers, or null
+  const safeMessage = String(message ?? '');
+  return safeMessage.replace(/sk-[a-zA-Z0-9_-]{10,}/g, 'sk-***REDACTED***');
 }
 
 function normalizeStreamError(error, statusCode = 500) {
@@ -1251,6 +1264,10 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
   }
   
   if (nvidiaRateLimitDetected) {
+    // Destroy the upstream stream and abort the controller before throwing
+    // to prevent socket/stream leaks on NVIDIA rate-limit paths
+    try { axiosResponse.data.destroy(); } catch {}
+    try { abortController.abort(); } catch {}
     const error = new Error('NVIDIA rate limit exceeded');
     error.isNvidiaRateLimit = true;
     throw error;
