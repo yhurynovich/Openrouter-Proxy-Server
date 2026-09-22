@@ -122,6 +122,28 @@ class FailoverManager {
     return data.error?.message || data.message || safeStringify(data);
   }
 
+  _extractMetadataErrorType(error) {
+    const data = error?.response?.data || error;
+    if (!data || typeof data !== 'object') return null;
+    return data.error?.metadata?.error_type || data.metadata?.error_type || null;
+  }
+
+  isMetadataOverloadedError(error) {
+    const errorType = this._extractMetadataErrorType(error);
+    if (!errorType || typeof errorType !== 'string') return false;
+
+    const lower = errorType.toLowerCase();
+    return (
+      lower.includes('overloaded') ||
+      lower.includes('capacity') ||
+      lower.includes('provider_overloaded') ||
+      lower.includes('rate_limit') ||
+      lower.includes('temporarily_unavailable') ||
+      lower.includes('service_unavailable') ||
+      lower.includes('timeout')
+    );
+  }
+
   isModelOverloadedError(error) {
     const errorMessage = this._extractErrorMessage(error);
     if (typeof errorMessage !== 'string') return false;
@@ -135,6 +157,32 @@ class FailoverManager {
       lower.includes('no provider') ||
       lower.includes('temporarily unavailable')
     );
+  }
+
+  isUpstreamServiceError(error) {
+    const errorMessage = this._extractErrorMessage(error);
+    if (typeof errorMessage !== 'string') return false;
+
+    const lower = errorMessage.toLowerCase();
+
+    // Detect OpenRouter's upstream error format: "Upstream error from <provider>: <details>"
+    // This is different from our own sanitized "Upstream service error" which is short
+    // Real upstream errors are longer and contain provider info + specific error details
+    const isRealUpstreamError = lower.includes('upstream error from') && 
+      (lower.includes('overloaded') ||
+       lower.includes('capacity') ||
+       lower.includes('temporarily unavailable') ||
+       lower.includes('service unavailable') ||
+       lower.includes('rate limit') ||
+       lower.includes('limit reached') ||
+       lower.includes('timeout') ||
+       lower.includes('try again'));
+
+    // Also catch generic "upstream" errors that are detailed (not our short sanitized version)
+    const isDetailedUpstreamError = lower.startsWith('upstream ') && 
+      errorMessage.length > 30; // Our sanitized message is exactly "Upstream service error" (21 chars)
+
+    return isRealUpstreamError || isDetailedUpstreamError;
   }
 
   isModelCapabilityError(error) {
@@ -175,6 +223,14 @@ class FailoverManager {
 
     if (status >= 500) {
       return 'server_error';
+    }
+
+    if (this.isUpstreamServiceError(error)) {
+      return 'upstream_service_error';
+    }
+
+    if (this.isMetadataOverloadedError(error)) {
+      return 'metadata_overloaded';
     }
 
     if (
@@ -221,6 +277,14 @@ class FailoverManager {
     }
 
     if (this.isModelOverloadedError(error)) {
+      return true;
+    }
+
+    if (this.isUpstreamServiceError(error)) {
+      return true;
+    }
+
+    if (this.isMetadataOverloadedError(error)) {
       return true;
     }
 

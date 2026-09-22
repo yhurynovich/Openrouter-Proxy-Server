@@ -6,10 +6,10 @@ services:
       dockerfile_inline: |
         FROM node:20-alpine
         WORKDIR /app
-        # Copy source directly from build context (local repo) to use
-        # the latest fixes instead of cloning from GitHub
-        COPY . .
-        RUN npm install && \
+        # Install Git, clone the repo, and install Node dependencies
+        RUN apk add --no-cache git && \
+            git clone https://github.com/yhurynovich/Openrouter-Proxy-Server.git . && \
+            npm install && \
             printf '#!/bin/sh\nset -e\nmkdir -p /app/data\n[ -e /app/keys.json ] || ln -s /app/data/keys.json /app/keys.json\nexec "$@"\n' > /entrypoint.sh && \
             chmod +x /entrypoint.sh
         EXPOSE 3000
@@ -26,17 +26,18 @@ services:
     environment:
       - PORT=3000
       - LOG_RETENTION_DAYS=14
+      - MAX_MESSAGES=2000
       # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
-      - LOG_LEVEL=warning
+      - LOG_LEVEL=debug
       # ---- Retry Settings ----
       - MAX_RETRIES=5                            # Max total retry attempts (rate limit + network)
       - MAX_RATE_LIMIT_RETRIES=5                 # Max retries specifically for rate limit (429) responses
       - RETRY_DELAY_MS=1000                      # Base delay between retries (ms)
-      - TOTAL_REQUEST_TIMEOUT_MS=60000           # Hard cap on total request time incl. retries (60s)
+      - TOTAL_REQUEST_TIMEOUT_MS=60000           # Hard cap on total request time incl. retries (ms)
       # ---- OpenRouter Identification ----
-      - HTTP_REFERER=http://localhost:3000       # Referer header sent to OpenRouter
-      - SITE_NAME=Thinkotron                     # Site title sent to OpenRouter (X-Title)
+      - HTTP_REFERER=https://hermes-agent.org    # Referer header sent to OpenRouter
+      - SITE_NAME="Hermes Agent"                 # Site title sent to OpenRouter (X-Title)
       # ---- Key Manager ----
       - KEY_MAX_ROTATION_DEPTH=4                 # Max key rotation recursion depth
       - KEY_MAX_FAILURE_COUNT=5                  # Failures before a key is deactivated
