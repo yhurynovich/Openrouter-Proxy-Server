@@ -25,6 +25,19 @@ function sanitizeHeaderValue(value) {
   return value.replace(/[\x00-\x1F\x7F]/g, '').substring(0, 500);
 }
 
+// Forward the calling app's own OpenRouter attribution headers, if it sent any.
+// OpenRouter gates some ":free" models to recognised agentic harnesses using these
+// headers, so dropping them can turn a working client into a 403. Only what the client
+// actually sent is forwarded; nothing is invented.
+function forwardedAttributionHeaders(req) {
+  const out = {};
+  const title = req.headers['x-openrouter-title'];
+  const categories = req.headers['x-openrouter-categories'];
+  if (typeof title === 'string' && title) out['X-OpenRouter-Title'] = sanitizeHeaderValue(title);
+  if (typeof categories === 'string' && categories) out['X-OpenRouter-Categories'] = sanitizeHeaderValue(categories);
+  return out;
+}
+
 const BLOCKED_HOSTNAMES = new Set([
   'localhost', 'metadata.google.internal', 'metadata',
   'metadata.azure.com',
@@ -224,6 +237,9 @@ const CONFIG = {
   // picks from the list is exactly what gets sent upstream. Bare names sent by older
   // clients are still resolved by toOpenRouterModelId().
   MODEL_LIST_IDS: process.env.MODEL_LIST_IDS === 'normalized' ? 'normalized' : 'full',
+  // The model ID mapping is rebuilt from OpenRouter's live model list on every start and
+  // then refreshed this often (minutes). 0 = only at startup (plus retries if it fails).
+  MODEL_MAP_REFRESH_MINUTES: parseIntEnv('MODEL_MAP_REFRESH_MINUTES', 360, 0, 10080),
   // Max model switches per request (0 = unlimited, try all models in the group)
   MAX_MODEL_FAILOVERS: parseIntEnv('MAX_MODEL_FAILOVERS', 0, 0, 100),
   MAX_MESSAGES: parseIntEnv('MAX_MESSAGES', 200, 1, 10000),
@@ -263,48 +279,27 @@ function createDnsResolver() {
 // Initialize a resolver for use in customLookup
 const dnsResolver = createDnsResolver();
 
-// Model ID Normalization - Automated
-// Fetches models from OpenRouter and builds dynamic mapping
-let modelIdMapping = new Map();
+// Model ID mapping - built ENTIRELY from OpenRouter's live model list. Nothing is hardcoded.
+//  - Rebuilt on every container start (the first fetch is awaited before requests are served).
+//  - If that fetch fails, it is retried in the background with backoff until it succeeds.
+//  - Refreshed every MODEL_MAP_REFRESH_MINUTES so free models that rotate in/out are tracked.
+//  - A failed or empty fetch NEVER wipes the last good mapping; new state is built aside and
+//    swapped in whole.
+// Until the first successful fetch, model IDs are passed through to OpenRouter untouched.
+//
+// /v1/models advertises exact OpenRouter IDs by default (MODEL_LIST_IDS=full), so a client
+// normally sends an ID that is already exact. The reverse lookup below only exists to resolve
+// bare/normalized names sent by older clients, and it is VARIANT-AWARE: free and paid IDs
+// live in separate maps so they can never overwrite each other.
+let modelIdMapping = new Map();                 // OpenRouter ID -> normalized ID (legacy listing mode)
 let modelIdMappingLoaded = false;
 let modelIdMappingPromise = null;
-
-// Reverse mapping (normalized ID -> OpenRouter ID).
-// /v1/models advertises *normalized* IDs (provider prefix and ":free" stripped), so
-// clients may send those back. The reverse lookup is VARIANT-AWARE: free and paid IDs
-// live in separate maps, so they can never overwrite each other.
-//   1. A request that is already an exact OpenRouter ID is NEVER rewritten.
-//   2. An explicit ":free" request only resolves to a ":free" ID (never paid/bare).
-//   3. See toOpenRouterModelId() for the remaining (bare-name) rules.
-
-// Known fallback mappings for edge cases (models that don't follow provider/model pattern)
-const FALLBACK_MODEL_MAPPING = Object.create(null);
-Object.assign(FALLBACK_MODEL_MAPPING, {
-  // Free models with :free suffix
-  'deepseek/deepseek-chat:free': 'deepseek-chat',
-  'deepseek/deepseek-coder:free': 'deepseek-coder',
-  'nvidia/nemotron-3-ultra-550b-a55b:free': 'nemotron-3-ultra',
-  'qwen/qwen-2.5-72b-instruct:free': 'qwen-2.5-72b',
-  'meta-llama/llama-3.1-8b-instruct:free': 'llama-3.1-8b-instruct',
-  'mistralai/mistral-7b-instruct:free': 'mistral-7b-instruct',
-  'google/gemma-2-9b-it:free': 'gemma-2-9b-it',
-  'microsoft/phi-3-mini-128k-instruct:free': 'phi-3-mini-128k',
-  'huggingface/zephyr-7b-beta:free': 'zephyr-7b-beta',
-  'nousresearch/nous-hermes-2-mixtral-8x7b-dpo:free': 'nous-hermes-2-mixtral-8x7b-dpo',
-  'openchat/openchat-7b:free': 'openchat-7b',
-  'undi95/toppy-m-7b:free': 'toppy-m-7b',
-  'gryphe/mythomax-l2-13b:free': 'mythomax-l2-13b',
-  'cognitivecomputations/dolphin-2.9.2-qwen2-7b:free': 'dolphin-2.9.2-qwen2-7b',
-  'sao10k/l3-70b-euryale-v2.1:free': 'l3-70b-euryale-v2.1',
-  'liquid/lfm-40b:free': 'lfm-40b',
-  'poolside/laguna-xs-2.1:free': 'laguna-xs-2.1',
-  'poolside/laguna-s-2.1:free': 'laguna-s-2.1',
-});
-
-// Reverse maps, split by variant so ":free" and paid IDs cannot collide.
-const REVERSE_FREE_MODEL_MAPPING = new Map(); // normalized name -> "provider/model:free"
-const REVERSE_PAID_MODEL_MAPPING = new Map(); // normalized name -> "provider/model" (non-free)
-const KNOWN_OPENROUTER_IDS = new Set();       // exact OpenRouter IDs (fallback + live list)
+let REVERSE_FREE_MODEL_MAPPING = new Map();     // normalized name -> "provider/model:free"
+let REVERSE_PAID_MODEL_MAPPING = new Map();     // normalized name -> "provider/model" (non-free)
+let KNOWN_OPENROUTER_IDS = new Set();           // exact IDs OpenRouter currently offers
+let modelMapTimer = null;
+const MODEL_MAP_RETRY_BASE_MS = 5000;           // retry backoff: 5s, 10s, 20s ... capped at 5 min
+const MODEL_MAP_RETRY_MAX_MS = 5 * 60 * 1000;
 
 // Split an ID into its bare model name and free flag: "a/b:free" -> { base: "b", isFree: true }
 function splitModelId(id) {
@@ -315,35 +310,49 @@ function splitModelId(id) {
   return { base, isFree };
 }
 
-function registerReverseMapping(openRouterId, normalizedId) {
-  const { base, isFree } = splitModelId(openRouterId);
-  const target = isFree ? REVERSE_FREE_MODEL_MAPPING : REVERSE_PAID_MODEL_MAPPING;
-  KNOWN_OPENROUTER_IDS.add(openRouterId);
-  for (const alias of new Set([normalizedId, base])) {
-    if (!alias) continue;
-    if (!target.has(alias)) {
-      target.set(alias, openRouterId);
-    } else if (target.get(alias) !== openRouterId) {
+/**
+ * Build (but do not apply) all mapping state from an OpenRouter model list.
+ * @param {Array} models - OpenRouter models array (GET /api/v1/models -> data)
+ * @returns {{mapping: Map, known: Set, free: Map, paid: Map}}
+ */
+function buildModelIdMapping(models) {
+  const mapping = new Map();
+  const known = new Set();
+  const free = new Map();
+  const paid = new Map();
+
+  for (const model of models) {
+    if (!model || typeof model.id !== 'string' || !model.id) continue;
+    const openRouterId = model.id;
+    const { base, isFree } = splitModelId(openRouterId);
+
+    mapping.set(openRouterId, base);
+    known.add(openRouterId);
+
+    const target = isFree ? free : paid;
+    if (!target.has(base)) {
+      target.set(base, openRouterId);
+    } else if (target.get(base) !== openRouterId) {
       // Same variant, different provider (e.g. two providers ship "foo:free"): first wins
       logInfo('Model ID collision in reverse mapping (keeping existing)', {
         context: 'ModelMapping',
-        alias,
-        existing: target.get(alias),
+        alias: base,
+        existing: target.get(base),
         new: openRouterId
       });
     }
   }
+  return { mapping, known, free, paid };
 }
 
-function seedReverseMappingsFromFallback() {
-  KNOWN_OPENROUTER_IDS.clear();
-  REVERSE_FREE_MODEL_MAPPING.clear();
-  REVERSE_PAID_MODEL_MAPPING.clear();
-  for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
-    registerReverseMapping(openRouterId, normalizedId);
-  }
+// Swap a freshly built mapping in as a whole
+function applyModelIdMapping(built) {
+  modelIdMapping = built.mapping;
+  KNOWN_OPENROUTER_IDS = built.known;
+  REVERSE_FREE_MODEL_MAPPING = built.free;
+  REVERSE_PAID_MODEL_MAPPING = built.paid;
+  modelIdMappingLoaded = true;
 }
-seedReverseMappingsFromFallback();
 
 /**
  * Resolve the model ID a client sent to the exact ID OpenRouter expects.
@@ -351,9 +360,9 @@ seedReverseMappingsFromFallback();
  *  2. Explicit ":free" (any/unknown prefix, or bare)             -> the ":free" ID only.
  *                                                                  Never downgraded to a paid/bare ID.
  *  3. Qualified ("x/y", no ":free") but not an exact known ID    -> the paid ID only.
- *  4. Bare name as advertised by /v1/models (suffix is hidden there) -> free first, then paid
- *     (legacy behaviour; this is the only ambiguous case).
- *  Anything unresolved is passed through untouched so OpenRouter returns its real error.
+ *  4. Bare name (older clients)                                  -> free first, then paid.
+ *  Anything unresolved (including everything before the first successful fetch) is passed
+ *  through untouched so OpenRouter returns its real error.
  */
 function toOpenRouterModelId(model) {
   if (!model || typeof model !== 'string') return model;
@@ -361,82 +370,36 @@ function toOpenRouterModelId(model) {
 
   const { base, isFree } = splitModelId(model);
   let resolved;
+  let variant = 'free';
   if (isFree) {
     resolved = REVERSE_FREE_MODEL_MAPPING.get(base);
   } else if (model.includes('/')) {
     resolved = REVERSE_PAID_MODEL_MAPPING.get(base);
+    variant = 'paid';
   } else {
-    resolved = REVERSE_FREE_MODEL_MAPPING.get(base) ?? REVERSE_PAID_MODEL_MAPPING.get(base);
+    resolved = REVERSE_FREE_MODEL_MAPPING.get(base);
+    if (!resolved) {
+      resolved = REVERSE_PAID_MODEL_MAPPING.get(base);
+      variant = 'paid';
+    }
   }
 
   if (!resolved || resolved === model) return model;
-  logInfo('Model ID resolved', { context: 'ModelMapping', requested: model, resolved });
+  logInfo('Model ID resolved', { context: 'ModelMapping', requested: model, resolved, variant });
   return resolved;
 }
 
 /**
- * Build model ID mapping from OpenRouter model list
- * @param {Array} models - OpenRouter models array
- * @returns {Map} Mapping of OpenRouter ID -> normalized ID
+ * Fetch OpenRouter's live model list and rebuild the mapping from it.
+ * Concurrent callers share one fetch. Throws on failure, leaving the last good mapping intact.
+ * @param {string} reason - 'startup' | 'refresh' | 'retry' (for logs)
+ * @returns {Promise<Map>} OpenRouter ID -> normalized ID
  */
-function buildModelIdMapping(models) {
-  const mapping = new Map();
-  // Rebuild reverse state from scratch to prevent stale entries from previous fetches
-  seedReverseMappingsFromFallback();
-  for (const [openRouterId, normalizedId] of Object.entries(FALLBACK_MODEL_MAPPING)) {
-    mapping.set(openRouterId, normalizedId);
-  }
-
-  if (!Array.isArray(models)) {
-    return mapping;
-  }
-
-  for (const model of models) {
-    if (!model || !model.id) continue;
-
-    const openRouterId = model.id;
-    let normalizedId = null;
-
-    // Check fallback mappings first
-    if (Object.prototype.hasOwnProperty.call(FALLBACK_MODEL_MAPPING, openRouterId)) {
-      normalizedId = FALLBACK_MODEL_MAPPING[openRouterId];
-    }
-    // Try to extract base model name from provider/model format
-    else {
-      const lastSlash = openRouterId.lastIndexOf('/');
-      if (lastSlash !== -1) {
-        const baseName = openRouterId.slice(lastSlash + 1);
-        // Remove :free suffix if present
-        normalizedId = baseName.replace(/:free$/, '');
-      } else {
-        // Already a simple name
-        normalizedId = openRouterId;
-      }
-    }
-
-    if (normalizedId) {
-      mapping.set(openRouterId, normalizedId);
-      registerReverseMapping(openRouterId, normalizedId);
-    }
-  }
-
-  return mapping;
-}
-
-/**
- * Fetch and build model ID mapping from OpenRouter
- * @returns {Promise<Map>} Model ID mapping
- */
-async function fetchAndBuildModelIdMapping() {
-  if (modelIdMappingLoaded) {
-    return modelIdMapping;
-  }
-  
-  // Return existing promise if already fetching
+async function fetchAndBuildModelIdMapping(reason = 'refresh') {
   if (modelIdMappingPromise) {
     return modelIdMappingPromise;
   }
-  
+
   modelIdMappingPromise = (async () => {
     let tempAxios;
     try {
@@ -447,23 +410,34 @@ async function fetchAndBuildModelIdMapping() {
       });
 
       const response = await tempAxios.get('https://openrouter.ai/api/v1/models');
-
-      if (response.data && response.data.data) {
-        modelIdMapping = buildModelIdMapping(response.data.data);
-        modelIdMappingLoaded = true;
-        logInfo('Model ID mapping loaded', {
-          context: 'ModelMapping',
-          count: modelIdMapping.size
-        });
-      } else {
-        throw new Error('Invalid model list response shape from OpenRouter');
+      const list = response.data?.data;
+      if (!Array.isArray(list) || list.length === 0) {
+        throw new Error('Invalid or empty model list response from OpenRouter');
       }
+
+      const built = buildModelIdMapping(list);
+      if (built.known.size === 0) {
+        throw new Error('Model list contained no usable model IDs');
+      }
+
+      const previous = KNOWN_OPENROUTER_IDS;
+      const removed = [...previous].filter(id => !built.known.has(id));
+      const added = [...built.known].filter(id => !previous.has(id));
+      applyModelIdMapping(built);
+
+      logInfo('Model ID mapping loaded', {
+        context: 'ModelMapping',
+        reason,
+        models: built.known.size,
+        freeAliases: built.free.size,
+        paidAliases: built.paid.size,
+        added: added.length,
+        removed: removed.length,
+        removedSample: removed.slice(0, 10)
+      });
+      return modelIdMapping;
     } catch (error) {
-      logError(error, { context: 'ModelMapping fetch failed' });
-      // Reset state to allow future retries
-      modelIdMapping = new Map();
-      modelIdMappingLoaded = false;
-      modelIdMappingPromise = null;
+      logError(error, { context: 'ModelMapping fetch failed', reason, keptPreviousMapping: modelIdMappingLoaded });
       throw error;
     } finally {
       // Destroy the temporary agent to prevent socket/handle leaks
@@ -475,15 +449,36 @@ async function fetchAndBuildModelIdMapping() {
         }
       }
     }
+  })().finally(() => {
+    modelIdMappingPromise = null;
+  });
 
-    return modelIdMapping;
-  })();
-  
   return modelIdMappingPromise;
 }
 
+// Background refresh / retry loop. After a failure it backs off; after a success it waits
+// MODEL_MAP_REFRESH_MINUTES (or stops if that is 0). The timer is unref'd so it never keeps
+// the process alive during shutdown.
+function scheduleModelIdMappingCycle(delayMs, attempt) {
+  if (modelMapTimer) clearTimeout(modelMapTimer);
+  modelMapTimer = setTimeout(async () => {
+    try {
+      await fetchAndBuildModelIdMapping(attempt > 0 ? 'retry' : 'refresh');
+      const refreshMs = CONFIG.MODEL_MAP_REFRESH_MINUTES * 60 * 1000;
+      if (refreshMs > 0) scheduleModelIdMappingCycle(refreshMs, 0);
+    } catch {
+      // Already logged by fetchAndBuildModelIdMapping; keep serving the last good mapping
+      scheduleModelIdMappingCycle(
+        Math.min(MODEL_MAP_RETRY_BASE_MS * 2 ** attempt, MODEL_MAP_RETRY_MAX_MS),
+        attempt + 1
+      );
+    }
+  }, delayMs);
+  modelMapTimer.unref?.();
+}
+
 /**
- * Normalize OpenRouter model ID to OpenAI-compatible format
+ * Normalize OpenRouter model ID to OpenAI-compatible format (legacy MODEL_LIST_IDS=normalized)
  * @param {string} openRouterId - OpenRouter model ID
  * @returns {string} Normalized model ID
  */
@@ -491,29 +486,11 @@ function normalizeModelId(openRouterId) {
   if (!openRouterId || typeof openRouterId !== 'string') {
     return openRouterId;
   }
-  
-  // Check dynamic mapping first (if loaded)
   if (modelIdMappingLoaded && modelIdMapping.has(openRouterId)) {
     return modelIdMapping.get(openRouterId);
   }
-  
-  // Check fallback mappings
-  if (Object.prototype.hasOwnProperty.call(FALLBACK_MODEL_MAPPING, openRouterId)) {
-    return FALLBACK_MODEL_MAPPING[openRouterId];
-  }
-  
-  // Try to extract base model name from provider/model format
-  // e.g., "openai/gpt-4o" -> "gpt-4o"
-  // Use lastIndexOf to handle IDs with multiple slashes (e.g., "org/sub/model")
-  const lastSlash = openRouterId.lastIndexOf('/');
-  if (lastSlash !== -1) {
-    const baseName = openRouterId.slice(lastSlash + 1);
-    // Remove :free suffix if present
-    return baseName.replace(/:free$/, '');
-  }
-  
-  // Return as-is if no mapping found
-  return openRouterId;
+  // e.g., "openai/gpt-4o" -> "gpt-4o", "poolside/laguna-xs-2.1:free" -> "laguna-xs-2.1"
+  return splitModelId(openRouterId).base;
 }
 
 /**
@@ -574,9 +551,14 @@ function normalizeModelObject(model) {
  */
 async function initializeModelIdMapping() {
   try {
-    await fetchAndBuildModelIdMapping();
+    // Rebuild from the live list on every start; the first fetch is awaited so the mapping
+    // is ready before requests are served.
+    await fetchAndBuildModelIdMapping('startup');
+    const refreshMs = CONFIG.MODEL_MAP_REFRESH_MINUTES * 60 * 1000;
+    if (refreshMs > 0) scheduleModelIdMappingCycle(refreshMs, 0);
   } catch (error) {
-    logError(error, { context: 'ModelMapping init failed' });
+    logError(error, { context: 'ModelMapping init failed (will retry in background)' });
+    scheduleModelIdMappingCycle(MODEL_MAP_RETRY_BASE_MS, 1);
   }
 }
 
@@ -1439,6 +1421,7 @@ app.post('/v1/chat/completions', async (req, res) => {
           'Authorization': `Bearer ${currentKey}`,
           'HTTP-Referer': sanitizeHeaderValue(clientReferer || CONFIG.HTTP_REFERER),
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
+          ...forwardedAttributionHeaders(req),
           'X-Request-ID': requestId
         },
         timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
@@ -1978,6 +1961,7 @@ app.post('/v1/messages', async (req, res) => {
           'Authorization': `Bearer ${currentKey}`,
           'HTTP-Referer': sanitizeHeaderValue(clientReferer || CONFIG.HTTP_REFERER),
           'X-Title': sanitizeHeaderValue(clientTitle || CONFIG.SITE_NAME),
+          ...forwardedAttributionHeaders(req),
           'X-Request-ID': requestId
         },
         timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),

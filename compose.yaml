@@ -43,6 +43,7 @@ services:
       - KEY_REACTIVATION_FAILURE_REDUCTION=2     # Failure-count reduction on bulk reactivation
       - KEY_BASE_RETRY_DELAY_MS=1500             # Base delay for exponential backoff (ms)
       - KEY_MAX_RETRY_DELAY_MS=30000             # Capped max delay for exponential backoff (ms)
+      - MODEL_MAP_REFRESH_MINUTES=360            # Refresh model list after
       # ---- Model Failover ----
       # When a model fails (overloaded, 5xx, or rate-limited across all keys),
       # the request is retried with the next model in the group.
