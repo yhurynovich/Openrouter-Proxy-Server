@@ -2124,10 +2124,18 @@ app.use((err, req, res, next) => {
     return next(err);
   }
 
-  res.status(500).json({
+  // Express/body-parser errors carry their own status; honor it instead of
+  // masking everything (e.g. a 413 body-too-large or 400 malformed JSON from
+  // an agent) as a generic 500 "Internal server error".
+  const statusCode = err?.status || err?.statusCode || 500;
+  const message = statusCode >= 500
+    ? 'Internal server error'
+    : String(err?.message || 'Invalid request');
+
+  res.status(statusCode).json({
     error: {
-      message: 'Internal server error',
-      type: 'internal_error'
+      message,
+      type: statusCode >= 500 ? 'internal_error' : 'invalid_request_error'
     }
   });
 });

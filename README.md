@@ -10,7 +10,7 @@ When using OpenRouter's free models like DeepSeek Chat, you often encounter rate
 
 1. **Managing Multiple API Keys**: Automatically rotates between your API keys when rate limits are hit
 2. **Keeping Services Running**: Tools like Aider and Roo-Code can keep working without interruption
-3. **Handling Failures Gracefully**: Smart retry logic and automatic recovery from errors
+3. **Handling Failures Gracefully**: Smart retry logic for non-streaming requests, and fail-fast forwarding of the real upstream error on streaming requests so agents never hang on a masked timeout
 4. **Being OpenAI Compatible**: Works as a drop-in replacement - just change the base URL
 5. **Anthropic Compatible**: Supports `/v1/messages` endpoint for Anthropic SDK users
 
@@ -53,7 +53,7 @@ const anthropic = new Anthropic({
 | **Key Management** 🔑         | **Streaming** 🌊           | **Observability** 📊         | **Security** 🔒           |
 |-------------------------------|---------------------------|-----------------------------|--------------------------|
 | Smart API key rotation         | Full streaming support    | Comprehensive logging       | Timing-safe auth         |
-| Sticky session optimization    | Automatic retry logic     | Daily log rotation          | Admin rate limiting      |
+| Sticky session optimization    | Fail-fast real errors     | Daily log rotation          | Admin rate limiting      |
 | JSON-based storage             | Connection management     | Error tracking (file + console) | Header injection protection |
 | Rate limit handling            | Chunk processing          | Key status monitoring       | Abort on client disconnect |
 | **Auto model ID normalization**| **Multi-modal support**   | **Error logs to file + console** | **Request validation** |
@@ -101,16 +101,22 @@ MAX_MESSAGE_LENGTH=100000           # Max characters per message (default: 100k)
 SSE_BUFFER_LIMIT=10485760           # SSE buffer limit in bytes (default: 10MB)
 
 # Retry Settings
-MAX_RETRIES=3                       # Max retry attempts (default: 3)
-RETRY_DELAY_MS=1000                 # Delay between retries in ms (default: 1000)
+MAX_RETRIES=10                      # Max total retry attempts, rate limit + network (default: 10)
+MAX_RATE_LIMIT_RETRIES=10           # Max retries for rate limit (429) responses (default: 10)
+RETRY_DELAY_MS=2000                 # Base delay between retries in ms (default: 2000)
+TOTAL_REQUEST_TIMEOUT_MS=600000     # Hard cap on total request time incl. retries (default: 10 min)
 
 # Timeouts
-AXIOS_TIMEOUT=120000                # Upstream request timeout in ms (default: 120s)
+AXIOS_TIMEOUT=300000                # Upstream request timeout in ms (default: 5 min)
 MODELS_TIMEOUT=30000                # Models endpoint timeout in ms (default: 30s)
 AXIOS_MAX_SOCKETS=50                # Max concurrent sockets (default: 50)
 AXIOS_MAX_FREE_SOCKETS=10           # Max free sockets (default: 10)
-AXIOS_KEEPALIVE_TIMEOUT=60000       # Keep-alive timeout in ms (default: 60s)
-AXIOS_FREE_SOCKET_TIMEOUT=30000     # Free socket timeout in ms (default: 30s)
+AXIOS_KEEPALIVE_TIMEOUT=300000      # Keep-alive timeout in ms (default: 5 min)
+AXIOS_FREE_SOCKET_TIMEOUT=60000     # Free socket timeout in ms (default: 1 min)
+AXIOS_IDLE_TIMEOUT=300000           # Idle timeout for upstream connections in ms (default: 5 min)
+
+# Tool / Function Calling Limits
+MAX_TOOL_CALLS=250                  # Max tools per request (default: 100, max: 10000)
 
 # Key Manager
 KEY_MAX_ROTATION_DEPTH=2            # Max key rotation recursion depth (default: 2)
