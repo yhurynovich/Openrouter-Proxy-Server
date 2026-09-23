@@ -568,7 +568,7 @@ async function initializeModelIdMapping() {
  * @param {number} statusCode - HTTP status code
  * @returns {Object} Normalized error response
  */
-function normalizeErrorResponse(error, statusCode = 500) {
+function normalizeErrorResponse(error, statusCode = 500, { exposeDetails = false } = {}) {
   // OpenAI error types mapping
   const errorTypeMap = {
     400: 'invalid_request_error',
@@ -644,7 +644,9 @@ function normalizeErrorResponse(error, statusCode = 500) {
     param = 'max_tokens';
   }
   
-  const sanitizedMessage = sanitizeClientMessage(message, statusCode);
+  const sanitizedMessage = exposeDetails
+    ? String(message ?? '').replace(/sk-[a-zA-Z0-9_-]{10,}/g, 'sk-***REDACTED***')
+    : sanitizeClientMessage(message, statusCode);
   
   const normalizedError = {
     error: {
@@ -684,7 +686,7 @@ function sanitizeClientMessage(message, statusCode) {
 }
 
 function normalizeStreamError(error, statusCode = 500) {
-  const normalized = normalizeErrorResponse(error, statusCode);
+  const normalized = normalizeErrorResponse(error, statusCode, { exposeDetails: true });
   return `data: ${JSON.stringify(normalized)}\n\n`;
 }
 
@@ -1527,66 +1529,12 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // Handle streaming errors - retry on rate limits or network errors, otherwise end stream
+      // Streaming errors are never retried and never failed-over: retrying
+      // while zero bytes have been written to the client holds the SSE
+      // connection open until the client's stale-stream watchdog fires and
+      // masks the real cause as a generic error. Instead forward the actual
+      // upstream status/message so the agent can react immediately.
       if (isStreaming) {
-        // For rate limits, we can retry even if some data was sent, but we need to be careful
-        // If it's a rate limit and we haven't sent much data, retry with a new key
-        // If it's a network error, retry regardless
-        const canRetryStream = !streamDataSent && !res.headersSent && (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) && retryCount < maxRetries - 1;
-        
-        if (canRetryStream) {
-          // If we've already spent more time than the total budget, don't retry
-          const elapsedBeforeRetry = Date.now() - requestStartTime;
-          if (elapsedBeforeRetry >= CONFIG.TOTAL_REQUEST_TIMEOUT_MS) {
-            logError(new Error('Total stream request timeout exceeded before retry'), {
-              context: 'Chat completions',
-              elapsedMs: elapsedBeforeRetry,
-              timeoutMs: CONFIG.TOTAL_REQUEST_TIMEOUT_MS,
-              retryCount
-            });
-            if (!res.writableEnded) {
-              res.write(normalizeStreamError({ error: { message: 'Request timeout: total processing time exceeded limit', type: 'timeout' } }, 504));
-              res.end();
-            }
-            return;
-          }
-          // Retry on rate limit or network errors for streaming too
-          retryCount++;
-          
-          // Determine wait time using shared helper (caps at remaining budget)
-          const remainingMs = CONFIG.TOTAL_REQUEST_TIMEOUT_MS - (Date.now() - requestStartTime);
-          const { waitMs, waitReason, shouldAbort } = calculateRetryDelay({
-            error, isRateLimit, retryCount, keyManager, remainingMs, retryDelayMs
-          });
-          
-          if (shouldAbort) {
-            if (!res.writableEnded) {
-              res.write(normalizeStreamError({ error: { message: 'Request timeout: total processing time exceeded limit', type: 'timeout' } }, 504));
-              res.end();
-            }
-            return;
-          }
-          
-          // Add delay for rate limits, network errors, or exhausted keys
-          if (isRateLimit || error.code === 'NO_AVAILABLE_KEYS' || shouldRetryForNetwork) {
-            logRetry('stream', { retryCount, maxRetries, waitMs, waitReason, errorCode: error.code, errorMessage });
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-          }
-          
-          // Reset streamDataSent since we're retrying with a fresh connection
-          streamDataSent = false;
-          
-          // Continue to next iteration of while loop (retry)
-          continue;
-        }
-        
-        // Non-retryable error or max retries reached - end stream with error
-        // If no data sent yet and error is failoverable, break to outer loop
-        if (!streamDataSent && failoverManager.shouldFailover(error) && modelIdx < failoverChain.length - 1) {
-          innerLoopError = error;
-          innerLoopStatusCode = error.response?.status || 500;
-          break;
-        }
         if (!res.writableEnded) {
           const errorForResponse = error?.response?.data || error;
           res.write(normalizeStreamError(errorForResponse, error.response?.status || 500));

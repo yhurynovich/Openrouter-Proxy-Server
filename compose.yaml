@@ -30,11 +30,16 @@ services:
       # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
       - LOG_LEVEL=debug
+      # ---- Upstream Connection (Axios / OpenRouter) ----
+      - AXIOS_TIMEOUT=300000                       # Per-request timeout (ms) - 5 min
+      - AXIOS_KEEPALIVE_TIMEOUT=300000             # Keep-alive timeout (ms) - 5 min
+      - AXIOS_FREE_SOCKET_TIMEOUT=60000            # Free socket timeout (ms) - 1 min
+      - AXIOS_IDLE_TIMEOUT=300000                  # Idle timeout for upstream connections (ms) - 5 min
       # ---- Retry Settings ----
-      - MAX_RETRIES=5                            # Max total retry attempts (rate limit + network)
-      - MAX_RATE_LIMIT_RETRIES=5                 # Max retries specifically for rate limit (429) responses
-      - RETRY_DELAY_MS=1000                      # Base delay between retries (ms)
-      - TOTAL_REQUEST_TIMEOUT_MS=60000           # Hard cap on total request time incl. retries (ms)
+      - MAX_RETRIES=10                             # Max total retry attempts (rate limit + network)
+      - MAX_RATE_LIMIT_RETRIES=10                  # Max retries specifically for rate limit (429) responses
+      - RETRY_DELAY_MS=2000                        # Base delay between retries (ms)
+      - TOTAL_REQUEST_TIMEOUT_MS=600000            # Hard cap on total request time incl. retries (ms) - 10 min
       # ---- OpenRouter Identification ----
       - HTTP_REFERER=https://hermes-agent.org    # Referer header sent to OpenRouter
       - SITE_NAME="Hermes Agent"                 # Site title sent to OpenRouter (X-Title)
