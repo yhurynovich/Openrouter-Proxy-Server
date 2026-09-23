@@ -24,6 +24,10 @@ All notable changes to the OpenRouter Proxy Server are documented in this file.
 
 - **Tool count limit for agent frameworks** — Added `MAX_TOOL_CALLS` (default 100, max 10000) to allow agentic frameworks (Hermes, OpenHands, Aider) that register 100+ tools to pass request validation `server.js:246, 942-943`.
 
+- **Global error handler no longer masks 4xx as 500** — Every uncaught error was returned as HTTP 500 `"Internal server error"`, including body-parser failures such as malformed JSON (`entity.parse.failed`, HTTP 400) and oversized request bodies (`entity.too.large`, HTTP 413 — the likely cause of the Hermes stall, since 100+ tool schemas can exceed `BODY_LIMIT`). The handler now honors `err.status`/`err.statusCode`, returning the real 4xx status and message, and only masks genuine 5xx `server.js:2116-2141`.
+
+- **Timeout/retry config values were silently ignored above old clamps** — `parseIntEnv()` falls back to the default when a value exceeds its `max`, so the raised `.env`/`compose.yaml` timeouts (e.g. `AXIOS_TIMEOUT=300000`, `TOTAL_REQUEST_TIMEOUT_MS=600000`) were discarded and reverted to 60s/90s. Raised the clamps in `CONFIG` (`AXIOS_TIMEOUT`, `AXIOS_KEEPALIVE_TIMEOUT`, `AXIOS_IDLE_TIMEOUT` max → 600000; `TOTAL_REQUEST_TIMEOUT_MS` max → 900000) so the configured budgets take effect `server.js:205-217`.
+
 ## Configuration defaults changed
 
 - Raised default upstream/retry budgets for long-running agent tasks: `AXIOS_TIMEOUT`, `AXIOS_KEEPALIVE_TIMEOUT`, and `AXIOS_IDLE_TIMEOUT` to 300000 ms (5 min), `AXIOS_FREE_SOCKET_TIMEOUT` to 60000 ms, `TOTAL_REQUEST_TIMEOUT_MS` to 600000 ms (10 min), `MAX_RETRIES` / `MAX_RATE_LIMIT_RETRIES` to 10, and `RETRY_DELAY_MS` to 2000 ms. See `.env.example` and `compose.yaml`.

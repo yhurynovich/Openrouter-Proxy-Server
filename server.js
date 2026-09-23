@@ -201,20 +201,18 @@ const CONFIG = {
   MAX_MESSAGE_LENGTH: parseIntEnv('MAX_MESSAGE_LENGTH', 100000, 1, 1000000),
   RATE_LIMIT_WINDOW_MS: parseIntEnv('RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000),
   RATE_LIMIT_MAX: parseIntEnv('RATE_LIMIT_MAX', 100, 1, 10000),
-  // Reduced from 120s to 60s to stay under Cloudflare's 100s timeout (error 524)
-  AXIOS_TIMEOUT: parseIntEnv('AXIOS_TIMEOUT', 60000, 1000, 120000),
+  // Long-running agent tasks need multi-minute budgets; keep under Cloudflare's 524 window only when no proxy sits in front.
+  AXIOS_TIMEOUT: parseIntEnv('AXIOS_TIMEOUT', 300000, 1000, 600000),
   AXIOS_MAX_SOCKETS: parseIntEnv('AXIOS_MAX_SOCKETS', 50, 1, 1000),
   AXIOS_MAX_FREE_SOCKETS: parseIntEnv('AXIOS_MAX_FREE_SOCKETS', 10, 1, 500),
-  AXIOS_KEEPALIVE_TIMEOUT: parseIntEnv('AXIOS_KEEPALIVE_TIMEOUT', 60000, 1000, 300000),
-  AXIOS_FREE_SOCKET_TIMEOUT: parseIntEnv('AXIOS_FREE_SOCKET_TIMEOUT', 30000, 1000, 300000),
-  // New: Idle timeout for upstream connections (default 30s)
-  AXIOS_IDLE_TIMEOUT: parseIntEnv('AXIOS_IDLE_TIMEOUT', 30000, 1000, 120000),
-  MAX_RETRIES: parseIntEnv('MAX_RETRIES', 5, 1, 20),
-  // Reduced from 10 to 5 to limit total retry time
-  MAX_RATE_LIMIT_RETRIES: parseIntEnv('MAX_RATE_LIMIT_RETRIES', 5, 1, 20),
-  RETRY_DELAY_MS: parseIntEnv('RETRY_DELAY_MS', 1000, 100, 30000),
-  // Total request timeout including all retries (90s < Cloudflare's 100s)
-  TOTAL_REQUEST_TIMEOUT_MS: parseIntEnv('TOTAL_REQUEST_TIMEOUT_MS', 90000, 5000, 120000),
+  AXIOS_KEEPALIVE_TIMEOUT: parseIntEnv('AXIOS_KEEPALIVE_TIMEOUT', 300000, 1000, 600000),
+  AXIOS_FREE_SOCKET_TIMEOUT: parseIntEnv('AXIOS_FREE_SOCKET_TIMEOUT', 60000, 1000, 300000),
+  AXIOS_IDLE_TIMEOUT: parseIntEnv('AXIOS_IDLE_TIMEOUT', 300000, 1000, 600000),
+  MAX_RETRIES: parseIntEnv('MAX_RETRIES', 10, 1, 20),
+  MAX_RATE_LIMIT_RETRIES: parseIntEnv('MAX_RATE_LIMIT_RETRIES', 10, 1, 20),
+  RETRY_DELAY_MS: parseIntEnv('RETRY_DELAY_MS', 2000, 100, 30000),
+  // Hard cap on total request time incl. retries (10 min)
+  TOTAL_REQUEST_TIMEOUT_MS: parseIntEnv('TOTAL_REQUEST_TIMEOUT_MS', 600000, 5000, 900000),
   SSE_BUFFER_LIMIT: parseIntEnv('SSE_BUFFER_LIMIT', 10 * 1024 * 1024, 1024, 50 * 1024 * 1024),
   SSE_MAX_EVENT_SIZE: 1024 * 1024, // 1 MB per SSE event
   MODELS_TIMEOUT: parseIntEnv('MODELS_TIMEOUT', 30000, 1000, 60000),
