@@ -28,6 +28,7 @@ services:
       - LOG_RETENTION_DAYS=14
       - MAX_MESSAGES=2000
       - MAX_TOOL_CALLS=260   #tools in a single request
+      - BODY_LIMIT=50mb      #max request body size (large tool schemas + context)
       # Use public DNS to resolve openrouter.ai (fixes DNS resolution failures in Docker)
       - OPENROUTER_DNS_SERVERS=192.168.31.199,192.168.31.66,8.8.8.8,8.8.4.4,208.67.222.222,208.67.220.220
       - LOG_LEVEL=debug
@@ -44,7 +45,7 @@ services:
       - KEY_MAX_FAILURE_COUNT=5                  # Failures before a key is deactivated
       - KEY_REACTIVATION_FAILURE_REDUCTION=2     # Failure-count reduction on bulk reactivation
       - KEY_BASE_RETRY_DELAY_MS=1500             # Base delay for exponential backoff (ms)
-      - KEY_MAX_RETRY_DELAY_MS=300000            # Capped max delay for exponential backoff (ms)  = 5munutes
+      - KEY_MAX_RETRY_DELAY_MS=300000            # Capped max delay for exponential backoff (ms) - 5 minutes
       - MODEL_MAP_REFRESH_MINUTES=360            # Refresh model list after
       # ---- Model Failover ----
       # When a model fails (overloaded, 5xx, or rate-limited across all keys),

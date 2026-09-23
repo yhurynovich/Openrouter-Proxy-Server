@@ -197,7 +197,7 @@ function parseIntEnv(name, defaultValue, min, max) {
 
 const CONFIG = {
   PORT: parseIntEnv('PORT', 3000, 1, 65535),
-  BODY_LIMIT: process.env.BODY_LIMIT || '5mb',
+  BODY_LIMIT: process.env.BODY_LIMIT || '50mb',
   MAX_MESSAGE_LENGTH: parseIntEnv('MAX_MESSAGE_LENGTH', 100000, 1, 1000000),
   RATE_LIMIT_WINDOW_MS: parseIntEnv('RATE_LIMIT_WINDOW_MS', 60000, 1000, 3600000),
   RATE_LIMIT_MAX: parseIntEnv('RATE_LIMIT_MAX', 100, 1, 10000),

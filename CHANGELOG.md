@@ -31,3 +31,5 @@ All notable changes to the OpenRouter Proxy Server are documented in this file.
 ## Configuration defaults changed
 
 - Raised default upstream/retry budgets for long-running agent tasks: `AXIOS_TIMEOUT`, `AXIOS_KEEPALIVE_TIMEOUT`, and `AXIOS_IDLE_TIMEOUT` to 300000 ms (5 min), `AXIOS_FREE_SOCKET_TIMEOUT` to 60000 ms, `TOTAL_REQUEST_TIMEOUT_MS` to 600000 ms (10 min), `MAX_RETRIES` / `MAX_RATE_LIMIT_RETRIES` to 10, and `RETRY_DELAY_MS` to 2000 ms. See `.env.example` and `compose.yaml`.
+
+- Raised default `BODY_LIMIT` from 5 MB to 50 MB. Agent frameworks (Hermes, OpenHands, Aider) send large tool schemas plus context; a request exceeding the old limit hit body-parser's `entity.too.large` (HTTP 413), which the global error handler previously masked as a generic 500 "Internal server error". See `server.js:200`, `.env.example`, `compose.yaml`, `README.md`.

@@ -96,7 +96,7 @@ OPENROUTER_DNS_SERVERS=             # Custom DNS servers for resolving openroute
 DNS_LOOKUP_TIMEOUT_MS=5000          # DNS lookup timeout in ms (default: 5000)
 
 # Request Limits
-BODY_LIMIT=5mb                      # Max request body size (default: 5mb)
+BODY_LIMIT=50mb                     # Max request body size (default: 50mb; large tool schemas + context)
 MAX_MESSAGE_LENGTH=100000           # Max characters per message (default: 100k)
 SSE_BUFFER_LIMIT=10485760           # SSE buffer limit in bytes (default: 10MB)
 
