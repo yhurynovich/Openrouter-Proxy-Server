@@ -714,6 +714,18 @@ function normalizeAnthropicError(openaiError, statusCode = 500) {
   };
 }
 
+// Terminal SSE error event for the Anthropic Messages endpoint, used once
+// content has already been streamed to the client and a retry/failover is
+// no longer safe. Anthropic's protocol has no [DONE] sentinel — closing the
+// response (res.end()) after this is the correct termination signal.
+function normalizeAnthropicStreamError(error, statusCode = 500) {
+  const normalized = normalizeAnthropicError(
+    normalizeErrorResponse(error, statusCode, { exposeDetails: true }),
+    statusCode
+  );
+  return `event: error\ndata: ${JSON.stringify(normalized)}\n\n`;
+}
+
 // OpenAI Chat Completions Request Validation
 // Validates request against OpenAI API specification
 function validateChatCompletionRequest(body) {
@@ -1336,6 +1348,193 @@ async function handleStreamingResponse(axiosResponse, req, res, abortController)
   }
 }
 
+// Convert an OpenRouter/OpenAI streaming chat-completion into Anthropic
+// Messages streaming events (message_start / content_block_* / message_delta
+// / message_stop) and forward them to the client as they arrive. The two
+// APIs' SSE formats are not compatible, so every event is re-encoded rather
+// than passed through — contrast with handleStreamingResponse above, which
+// proxies OpenAI-format bytes unchanged.
+//
+// Resolves normally on a clean completion (message_stop already sent, res
+// already ended). Throws on any problem detected while reading the upstream
+// stream; the caller decides whether that's still safe to retry/fail over
+// by checking whether anything was actually written to the client response
+// (tracked externally, the same way handleStreamingResponse's callers do).
+async function handleAnthropicStreamingResponse(axiosResponse, req, res, abortController, { requestId, model }) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const MAX_BUFFER_SIZE = CONFIG.SSE_BUFFER_LIMIT;
+  const MAX_EVENT_SIZE = CONFIG.SSE_MAX_EVENT_SIZE;
+  let buffer = '';
+  let clientClosed = false;
+
+  req.once('close', () => {
+    clientClosed = true;
+    axiosResponse.data.destroy();
+    abortController.abort();
+  });
+
+  const messageId = `msg_${requestId.replace(/-/g, '')}`;
+  let messageStarted = false;
+  let usage = { input_tokens: 0, output_tokens: 0 };
+  let stopReason = 'end_turn';
+  let nextBlockIndex = 0;
+  let textBlockIndex = null;
+  const toolBlocks = new Map(); // openaiIndex -> { blockIndex, started }
+
+  const sendEvent = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+
+  const ensureMessageStart = () => {
+    if (messageStarted) return;
+    messageStarted = true;
+    sendEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: messageId, type: 'message', role: 'assistant', model,
+        content: [], stop_reason: null, stop_sequence: null, usage
+      }
+    });
+  };
+
+  const ensureTextBlock = () => {
+    ensureMessageStart();
+    if (textBlockIndex === null) {
+      textBlockIndex = nextBlockIndex++;
+      sendEvent('content_block_start', {
+        type: 'content_block_start', index: textBlockIndex,
+        content_block: { type: 'text', text: '' }
+      });
+    }
+    return textBlockIndex;
+  };
+
+  const ensureToolBlock = (openaiIndex, id, name) => {
+    ensureMessageStart();
+    let entry = toolBlocks.get(openaiIndex);
+    if (!entry) {
+      entry = { blockIndex: nextBlockIndex++, started: false };
+      toolBlocks.set(openaiIndex, entry);
+    }
+    if (!entry.started) {
+      entry.started = true;
+      sendEvent('content_block_start', {
+        type: 'content_block_start', index: entry.blockIndex,
+        content_block: { type: 'tool_use', id: id || `toolu_${requestId}_${openaiIndex}`, name: name || '', input: {} }
+      });
+    }
+    return entry.blockIndex;
+  };
+
+  const handleChunk = (data) => {
+    ensureMessageStart();
+    if (data.usage) {
+      usage = {
+        input_tokens: data.usage.prompt_tokens ?? usage.input_tokens,
+        output_tokens: data.usage.completion_tokens ?? usage.output_tokens,
+      };
+    }
+    const choice = data.choices?.[0];
+    if (!choice) return;
+    const delta = choice.delta || {};
+
+    if (typeof delta.content === 'string' && delta.content.length > 0) {
+      const idx = ensureTextBlock();
+      sendEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'text_delta', text: delta.content } });
+    }
+
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const openaiIndex = tc.index ?? 0;
+        const idx = ensureToolBlock(openaiIndex, tc.id, tc.function?.name);
+        const argsFragment = tc.function?.arguments;
+        if (typeof argsFragment === 'string' && argsFragment.length > 0) {
+          sendEvent('content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: argsFragment } });
+        }
+      }
+    }
+
+    if (choice.finish_reason) {
+      stopReason = mapFinishReason(choice.finish_reason);
+    }
+  };
+
+  // Returns 'ratelimit' | 'error' | null (null = processed normally)
+  const processBuffer = () => {
+    while (true) {
+      const delimiterIndex = buffer.indexOf('\n\n');
+      if (delimiterIndex === -1) break;
+      const event = buffer.slice(0, delimiterIndex);
+      buffer = buffer.slice(delimiterIndex + 2);
+
+      if (event.length > MAX_EVENT_SIZE) {
+        logError(new Error('SSE event exceeded maximum size'), { context: 'Anthropic stream', eventSize: event.length });
+        return 'error';
+      }
+      if (!event.startsWith('data: ')) continue;
+      const dataStr = event.slice(6).trim();
+      if (dataStr === '[DONE]') continue;
+
+      let data;
+      try { data = JSON.parse(dataStr); } catch { continue; }
+
+      if (data.error && data.error.message) {
+        const isRateLimit = KeyManager.isRateLimitError({ response: { data, status: 200, headers: {} } });
+        logInfo(isRateLimit ? 'Rate limit detected in SSE chunk' : 'Upstream error in SSE chunk', {
+          context: 'Anthropic stream', errorMessage: String(data.error.message).substring(0, 200)
+        });
+        return isRateLimit ? 'ratelimit' : 'error';
+      }
+
+      handleChunk(data);
+    }
+    return null;
+  };
+
+  let stopSignal = null;
+  for await (const chunk of axiosResponse.data) {
+    if (clientClosed) break;
+    buffer += chunk.toString();
+    if (buffer.length > MAX_BUFFER_SIZE) {
+      logError(new Error('SSE buffer exceeded maximum size'), { context: 'Anthropic stream', bufferSize: buffer.length });
+      stopSignal = 'error';
+      break;
+    }
+    stopSignal = processBuffer();
+    if (stopSignal) break;
+  }
+  if (!clientClosed && !stopSignal) {
+    stopSignal = processBuffer();
+  }
+
+  if (clientClosed) return;
+
+  if (stopSignal === 'ratelimit' || stopSignal === 'error') {
+    try { axiosResponse.data.destroy(); } catch {}
+    try { abortController.abort(); } catch {}
+    const error = new Error(stopSignal === 'ratelimit' ? 'Rate limit mid-stream' : 'Upstream error mid-stream');
+    if (stopSignal === 'ratelimit') error.isRateLimit = true;
+    throw error;
+  }
+
+  // Clean completion
+  if (textBlockIndex !== null) {
+    sendEvent('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+  }
+  for (const entry of toolBlocks.values()) {
+    if (entry.started) sendEvent('content_block_stop', { type: 'content_block_stop', index: entry.blockIndex });
+  }
+  ensureMessageStart(); // guarantee message_start even on a genuinely empty response
+  sendEvent('message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: usage.output_tokens }
+  });
+  sendEvent('message_stop', { type: 'message_stop' });
+  if (!res.writableEnded) res.end();
+}
+
 // OpenRouter proxy endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   // Validate request against OpenAI Chat Completions schema
@@ -1527,15 +1726,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         return;
       }
 
-      // Streaming errors are never retried and never failed-over: retrying
-      // while zero bytes have been written to the client holds the SSE
-      // connection open until the client's stale-stream watchdog fires and
-      // masks the real cause as a generic error. Instead forward the actual
-      // upstream status/message so the agent can react immediately.
-      if (isStreaming) {
+      // Once any bytes have reached the client on this stream, retrying or
+      // failing over would corrupt/duplicate output, so from that point a
+      // stream error is terminal: forward it and close (with the [DONE]
+      // sentinel SSE clients expect). Before that point nothing has been
+      // committed to the client yet, so it's safe to fall through to the
+      // same retry/failover logic used for non-streaming requests below —
+      // the caller just sees the stream start a little later.
+      if (isStreaming && streamDataSent) {
         if (!res.writableEnded) {
           const errorForResponse = error?.response?.data || error;
           res.write(normalizeStreamError(errorForResponse, error.response?.status || 500));
+          res.write('data: [DONE]\n\n');
           res.end();
         }
         return;
@@ -1613,12 +1815,11 @@ app.post('/v1/chat/completions', async (req, res) => {
         requestBodyKeys: Object.keys(req.body || {})
       });
 
-      // For streaming, the stream was already ended in the streaming path above
-      if (isStreaming) {
-        return;
-      }
-
-      // For non-streaming, store error for outer loop (failover) consideration
+      // Store error for outer loop (failover) consideration. For streaming
+      // requests this is only reached when nothing has been sent to the
+      // client yet (see the streamDataSent check above), so it's safe to
+      // let the outer loop try the next model exactly as it does for a
+      // non-streaming request.
       innerLoopError = error;
       innerLoopStatusCode = error.response?.status || 500;
       break;
@@ -1637,6 +1838,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       const errorForResponse = innerLoopError?.response?.data || innerLoopError;
       if (isStreaming && !res.writableEnded) {
         res.write(normalizeStreamError(errorForResponse, innerLoopStatusCode));
+        res.write('data: [DONE]\n\n');
         res.end();
       } else if (!res.headersSent) {
         return res.status(innerLoopStatusCode).json(normalizeErrorResponse(errorForResponse, innerLoopStatusCode));
@@ -1814,6 +2016,8 @@ app.post('/v1/messages', async (req, res) => {
   // Use higher retry limit for rate limit errors
   const maxRetries = CONFIG.MAX_RATE_LIMIT_RETRIES;
 
+  const isStreaming = req.body.stream === true;
+
   // Model failover: build chain of interchangeable models
   const originalModel = req.body.model;
   const failoverChain = failoverManager.getFailoverChain(originalModel) || [originalModel];
@@ -1835,6 +2039,9 @@ app.post('/v1/messages', async (req, res) => {
       return msg;
     }),
     stream: req.body.stream || false,
+    // Ask for a final usage-bearing chunk so the translated Anthropic
+    // message_delta event can report real token counts instead of 0.
+    ...(req.body.stream ? { stream_options: { include_usage: true } } : {}),
     max_tokens: req.body.max_tokens,
     temperature: req.body.temperature,
     top_p: req.body.top_p,
@@ -1860,6 +2067,7 @@ app.post('/v1/messages', async (req, res) => {
     let retryCount = 0;
     let innerLoopError = null;
     let innerLoopStatusCode = null;
+    let streamDataSent = false;
 
     // Transform Anthropic format to OpenAI format (with current failover model)
     const openAIBody = {
@@ -1913,18 +2121,9 @@ app.post('/v1/messages', async (req, res) => {
         timeout: Math.max(100, Math.min(CONFIG.AXIOS_TIMEOUT, remainingMs)),
         signal: createAbortSignal(abortController, remainingMs)
       };
-      
-      // Reject streaming early — Anthropic SSE format differs from OpenAI SSE
-      // and no translation layer is implemented. Check before the upstream call
-      // to avoid opening a stream that is never consumed (socket leak + quota waste).
-      if (openAIBody.stream) {
-        return res.status(501).json({
-          type: 'error',
-          error: {
-            type: 'not_implemented',
-            message: 'Streaming is not yet supported for the Anthropic Messages endpoint',
-          }
-        });
+
+      if (isStreaming) {
+        axiosConfig.responseType = 'stream';
       }
 
       // Exact OpenRouter IDs pass through; advertised/normalized names are resolved (variant-aware)
@@ -1935,7 +2134,27 @@ app.post('/v1/messages', async (req, res) => {
         openAIBody,
         axiosConfig
       );
-      
+
+      if (isStreaming) {
+        // Track whether any bytes reached the client on this attempt, so a
+        // later error knows whether a retry/failover is still safe (mirrors
+        // the same pattern used in the /v1/chat/completions handler).
+        const originalWrite = res.write;
+        try {
+          res.write = function(chunk) {
+            if (chunk && chunk.length > 0) streamDataSent = true;
+            return originalWrite.apply(this, arguments);
+          };
+          await keyManager.markKeySuccess();
+          await handleAnthropicStreamingResponse(response, req, res, abortController, {
+            requestId, model: currentFailoverModel
+          });
+          return;
+        } finally {
+          res.write = originalWrite;
+        }
+      }
+
       // Check for error in response body
       const responseData = response.data;
       if (responseData?.error?.message) {
@@ -2029,6 +2248,17 @@ app.post('/v1/messages', async (req, res) => {
 
       // If the client disconnected, do NOT retry — downstream is gone
       if (isClientDisconnect(activeAbortController, classified)) {
+        return;
+      }
+
+      // Once any bytes have reached the client on this stream, a retry or
+      // failover would corrupt/duplicate output — terminate with an
+      // Anthropic-format error event instead of retrying silently.
+      if (isStreaming && streamDataSent) {
+        if (!res.writableEnded) {
+          res.write(normalizeAnthropicStreamError(error?.response?.data || error, error.response?.status || 500));
+          res.end();
+        }
         return;
       }
 
