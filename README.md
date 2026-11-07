@@ -4,6 +4,10 @@
 
 > A proxy server that makes OpenRouter's free models more reliable by handling API key rotation and rate limiting
 
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?logo=paypal)](https://www.paypal.com/ncp/payment/U42MC9YY623QA)
+
+If this project saves you time, consider [supporting it with a PayPal donation](https://www.paypal.com/ncp/payment/U42MC9YY623QA).
+
 ## Why Use This?
 
 When using OpenRouter's free models like DeepSeek Chat, you often encounter rate limits that can disrupt your workflow. This proxy server solves that by:
